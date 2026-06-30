@@ -1,0 +1,25 @@
+node_modules
+.next
+out
+build
+.git
+.gitignore
+.idea
+.vscode
+.vercel
+coverage
+npm-debug.log*
+.DS_Store
+*.tsbuildinfo
+
+# Never bake env files / secrets into the image. NEXT_PUBLIC_* values are passed
+# as build args instead, and runtime secrets are injected by docker-compose.
+.env
+.env.*
+
+# Build/deploy artifacts not needed inside the image.
+Dockerfile
+.dockerignore
+docker-compose.yml
+README.md
+GAME_IDEAS.md

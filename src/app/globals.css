@@ -1,0 +1,93 @@
+@import "tailwindcss";
+
+:root {
+  --background: #0b0a1a;
+  --foreground: #f5f3ff;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+html,
+body {
+  background: var(--background);
+  color: var(--foreground);
+}
+
+body {
+  min-height: 100dvh;
+  background:
+    radial-gradient(1200px 600px at 15% -10%, rgba(124, 58, 237, 0.35), transparent 60%),
+    radial-gradient(900px 500px at 110% 10%, rgba(236, 72, 153, 0.28), transparent 55%),
+    radial-gradient(800px 700px at 50% 120%, rgba(34, 211, 238, 0.18), transparent 60%),
+    var(--background);
+  background-attachment: fixed;
+  font-family: var(--font-sans), system-ui, sans-serif;
+}
+
+/* Reusable surface card */
+.card {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  backdrop-filter: blur(12px);
+  border-radius: 1.25rem;
+}
+
+@keyframes pop-in {
+  0% {
+    transform: scale(0.9);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+.animate-pop {
+  animation: pop-in 0.25s ease-out both;
+}
+
+@keyframes float-up {
+  0% {
+    transform: translateY(0);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(-40px);
+    opacity: 0;
+  }
+}
+
+@keyframes confetti-fall {
+  0% {
+    transform: translateY(-10vh) rotate(0deg);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(110vh) rotate(720deg);
+    opacity: 0.9;
+  }
+}
+.confetti-piece {
+  position: fixed;
+  top: 0;
+  width: 10px;
+  height: 16px;
+  border-radius: 2px;
+  animation: confetti-fall linear forwards;
+  z-index: 50;
+  pointer-events: none;
+}
+
+/* Hide scrollbars on the big-screen host view but keep scrollable */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}

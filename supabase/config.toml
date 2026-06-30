@@ -1,0 +1,3 @@
+# Supabase CLI project config. Lets you run `supabase link` / `supabase db push`
+# against the hosted project from this repo.
+project_id = "dlfjcxnnmtkzupvhdivw"

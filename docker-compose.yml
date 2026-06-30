@@ -1,0 +1,43 @@
+# Dev Social — single-container deploy (Next.js app + Socket.IO game server).
+#
+# Usage:
+#   1. cp .env.docker.example .env   # then paste your service_role key
+#   2. docker compose up -d --build
+#
+# Front it with nginx (see README "Deploy" section): route /socket.io/ -> 3001
+# and everything else -> 3000 on https://devsocial.adaptivesoftware.co.
+
+services:
+  devsocial:
+    build:
+      context: .
+      args:
+        # NEXT_PUBLIC_* are inlined into the browser bundle at BUILD time.
+        # These are public/non-secret values.
+        NEXT_PUBLIC_GAME_SERVER_URL: "https://devsocial.adaptivesoftware.co"
+        NEXT_PUBLIC_SUPABASE_URL: "https://dlfjcxnnmtkzupvhdivw.supabase.co"
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: "sb_publishable_BKDF8Jx85S4jPZy7UUembg_vQK2GW6g"
+    image: devsocial:latest
+    container_name: devsocial
+    restart: unless-stopped
+    ports:
+      - "3000:3000" # Next.js app  (nginx: location / )
+      - "3001:3001" # Socket.IO    (nginx: location /socket.io/ )
+    environment:
+      NODE_ENV: production
+      # Lock CORS on the realtime server to your public origin (was "*").
+      GAME_CLIENT_ORIGIN: "https://devsocial.adaptivesoftware.co"
+      # Server-side Supabase access (writes + photo uploads).
+      SUPABASE_URL: "https://dlfjcxnnmtkzupvhdivw.supabase.co"
+    # The service_role secret is injected at runtime from .env (copy from
+    # .env.docker.example). Kept out of `environment:` so `docker compose build`
+    # doesn't require the secret to be present.
+    env_file:
+      - path: .env
+        required: false
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
