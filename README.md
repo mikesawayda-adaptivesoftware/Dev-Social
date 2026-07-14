@@ -305,49 +305,131 @@ Build the image locally and run both processes:
 docker compose up -d --build
 ```
 
-### Option B — publish to Docker Hub, run on Unraid (`deploy.sh`)
+### Option B — publish to ghcr.io, run on Unraid (`deploy.sh`)
 
 For a build-on-your-Mac, run-on-Unraid flow, use the included `deploy.sh`. It
 builds a **`linux/amd64`** image (Unraid's arch — a plain `docker compose build`
 on Apple Silicon would produce an arm64 image that won't run there), pushes it to
-Docker Hub, and prints the Unraid `docker run` command.
+the **GitHub Container Registry** (`ghcr.io`), and prints the Unraid setup +
+`docker run` commands.
 
 ```bash
 # one-time setup
-export DOCKERHUB_TOKEN='...'        # hub.docker.com -> Account Settings -> Personal access tokens
-# edit DOCKERHUB_USERNAME at the top of deploy.sh
+export GITHUB_CR_PAT='ghp_...'   # GitHub PAT with write:packages + read:packages
+                                 #   https://github.com/settings/tokens
 
-./deploy.sh                  # build (linux/amd64) + push to Docker Hub
-./deploy.sh "commit message" # git commit/push first (if REPO_URL set), then build + push
+./deploy.sh                  # build (linux/amd64) + push to ghcr.io
+./deploy.sh "commit message" # git commit/push to GitHub first, then build + push
 ./deploy.sh --local          # build & run locally via docker compose
 ```
 
-The printed `docker run` maps both ports and injects the runtime env (incl. the
-`service_role` from your `.env`):
+The image is `ghcr.io/mikesawayda-adaptivesoftware/dev-social:latest`. Public
+config (origin, Supabase URL/anon key, optional Maps key) is set at the top of
+`deploy.sh` and baked in as build args; the `service_role` secret is read from
+`.env` and injected at run time only.
+
+> **Make the ghcr package public** (one-time) so Unraid can pull without a login,
+> or keep it private and `docker login ghcr.io` on Unraid first (step 2 below).
+> GitHub → your profile → Packages → `dev-social` → Package settings → Change
+> visibility.
+
+The printed first-time Unraid setup (also emitted by the script):
 
 ```bash
+# 1. (private package only) login to ghcr.io
+echo 'YOUR_GITHUB_PAT' | docker login ghcr.io -u mikesawayda-adaptivesoftware --password-stdin
+
+# 2. save the Supabase service_role secret ONCE (reused on every update)
+mkdir -p /mnt/user/appdata/dev-social
+printf %s 'YOUR_SUPABASE_SERVICE_ROLE_KEY' > /mnt/user/appdata/dev-social/service_role
+chmod 600 /mnt/user/appdata/dev-social/service_role
+
+# 3. pull + run (host ports 3092 = app, 3093 = socket)
+docker pull ghcr.io/mikesawayda-adaptivesoftware/dev-social:latest
+docker rm -f dev-social 2>/dev/null || true
+SERVICE_ROLE=$(cat /mnt/user/appdata/dev-social/service_role)
 docker run -d --name dev-social --restart unless-stopped \
-  -p 3000:3000 -p 3001:3001 \
+  -p 3092:3000 -p 3093:3001 \
   -e NODE_ENV=production \
-  -e GAME_CLIENT_ORIGIN='https://devsocial.adaptivesoftware.co' \
-  -e SUPABASE_URL='https://YOUR-PROJECT.supabase.co' \
-  -e SUPABASE_SERVICE_ROLE_KEY='your-service-role-key' \
-  docker.io/<your-user>/dev-social:latest
+  -e GAME_CLIENT_ORIGIN='https://dev-social.adaptivesoftware.co' \
+  -e SUPABASE_URL='https://dlfjcxnnmtkzupvhdivw.supabase.co' \
+  -e SUPABASE_SERVICE_ROLE_KEY="$SERVICE_ROLE" \
+  ghcr.io/mikesawayda-adaptivesoftware/dev-social:latest
 ```
 
-### Put it behind nginx
+To update after a future `./deploy.sh`: re-run steps 3 (pull → rm → run); the
+saved `service_role` file is reused.
 
-Route one public origin to the two ports — the `/socket.io/` location (with
-WebSocket upgrade headers) must come *before* `/`:
+### Reverse proxy: Cloudflare + Nginx Proxy Manager
+
+The live deployment fronts one public origin —
+`https://dev-social.adaptivesoftware.co` — with **Cloudflare** (DNS + edge TLS)
+in front of **Nginx Proxy Manager** (NPM, TLS + routing on the LAN). The two
+container ports stay LAN-internal; only the HTTPS origin is public.
+
+```
+Browser ──HTTPS──> Cloudflare (proxied) ──HTTPS──> Nginx Proxy Manager
+                                                      ├─ /          → 192.168.0.248:3092  (Next.js app)
+                                                      └─ /socket.io/ → 192.168.0.248:3093  (Socket.IO)
+```
+
+**1. Cloudflare DNS** — add a proxied CNAME (one per app; there is no wildcard):
+
+| Field        | Value                    |
+| ------------ | ------------------------ |
+| Type         | `CNAME`                  |
+| Name         | `dev-social`             |
+| Target       | `adaptivesoftware.co`    |
+| Proxy status | 🟠 Proxied (orange cloud) |
+| TTL          | Auto                     |
+
+Account-wide **SSL/TLS mode must be Full** (or Full strict) so Cloudflare speaks
+HTTPS to NPM's Let's Encrypt cert — *Flexible* causes redirect loops with Force
+SSL. WebSockets traverse the proxy automatically (the 100s proxy timeout does not
+apply to them).
+
+**2. Nginx Proxy Manager** — one proxy host with a custom location for the socket:
+
+- **Details tab** — Domain `dev-social.adaptivesoftware.co`, Scheme `http`,
+  Forward Hostname/IP `192.168.0.248`, Forward Port `3092`, **Websockets Support ON**.
+- **Custom Locations tab** — add location `/socket.io/`, Scheme `http`, Forward
+  `192.168.0.248`, Port `3093`. Click the ⚙️ gear and paste:
+
+  ```nginx
+  proxy_http_version 1.1;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_set_header Host $host;
+  proxy_read_timeout 86400s;
+  proxy_send_timeout 86400s;
+  ```
+
+- **SSL tab** — request a Let's Encrypt cert, Force SSL on. If issuance fails
+  while Cloudflare is proxying (the HTTP-01 challenge is blocked), set the CF
+  record to **DNS only** (grey cloud) temporarily, issue the cert, then re-enable
+  Proxied.
+
+NPM writes the `/socket.io/` block above the default `location /`, so ordering is
+handled for you. `GAME_CLIENT_ORIGIN` (set on the container) locks the realtime
+server's CORS to this origin.
+
+> **Hostname must match everywhere.** `NEXT_PUBLIC_GAME_SERVER_URL` is baked into
+> the browser bundle at build time, so the Cloudflare record, the NPM proxy host,
+> and `PUBLIC_ORIGIN` in `deploy.sh` must all use the exact same hostname
+> (`dev-social.adaptivesoftware.co`). A mismatch loads the page but silently
+> fails the socket connection — rebuild after any change.
+
+<details>
+<summary>Equivalent hand-rolled nginx (if you don't use NPM)</summary>
 
 ```nginx
 server {
     listen 443 ssl;
-    server_name devsocial.adaptivesoftware.co;
+    server_name dev-social.adaptivesoftware.co;
     # ssl_certificate ... (Cloudflare Origin cert or Let's Encrypt)
 
-    location /socket.io/ {              # realtime -> game server
-        proxy_pass http://UNRAID_HOST:3001;
+    location /socket.io/ {              # realtime -> game server (MUST precede /)
+        proxy_pass http://192.168.0.248:3093;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -359,7 +441,7 @@ server {
     }
 
     location / {                        # app -> Next.js
-        proxy_pass http://UNRAID_HOST:3000;
+        proxy_pass http://192.168.0.248:3092;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -370,13 +452,33 @@ server {
 }
 ```
 
-WebSockets pass through Cloudflare's proxy automatically (the 100s proxy timeout
-doesn't apply to them). `GAME_CLIENT_ORIGIN` in compose locks the realtime
-server's CORS to your origin.
+</details>
 
 > The schema for the hosted Supabase project lives in `supabase/migrations/`.
 > Apply it with the Supabase CLI (`supabase db push`) or the dashboard SQL editor
 > before first run.
+
+### Deploy checklist
+
+1. Cloudflare: proxied CNAME `dev-social` → `adaptivesoftware.co`.
+2. NPM: proxy host `dev-social.adaptivesoftware.co` → `:3092` (websockets on) +
+   `/socket.io/` location → `:3093`, Let's Encrypt SSL.
+3. `.env` has `SUPABASE_SERVICE_ROLE_KEY` (and optionally
+   `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` to ship GeoGuessr enabled).
+4. Start Docker Desktop, `export GITHUB_CR_PAT=…`, run `./deploy.sh "message"`.
+5. On Unraid: run the printed setup (saves `service_role`, then pull → run).
+6. Open `https://dev-social.adaptivesoftware.co` and start a game to confirm the
+   socket connects (check the browser console for a `/socket.io/` connection).
+
+### Updating vs. troubleshooting
+
+| Symptom | Likely cause |
+| ------- | ------------ |
+| Page loads, but "connecting…" never resolves / games don't start | Socket blocked — check the NPM `/socket.io/` location points at `:3093` with the upgrade headers, and the baked origin matches the domain |
+| Redirect loop / `ERR_TOO_MANY_REDIRECTS` | Cloudflare SSL/TLS mode is *Flexible* — set it to *Full* |
+| `docker pull` denied on Unraid | Package is private — `docker login ghcr.io` (step 1) or make the ghcr package public |
+| GeoGuessr shows a setup hint | No `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` was set at **build** time — add it to `.env` and re-run `./deploy.sh` (it's baked, not runtime) |
+| Leaderboard errors / no persistence | `SUPABASE_SERVICE_ROLE_KEY` missing on the container, or migrations not applied to the project |
 
 ## Scripts
 
@@ -389,7 +491,7 @@ server's CORS to your origin.
 | `node scripts/smoke2.mjs` | Deterministic scoring test              |
 | `node scripts/smokeGeo.mjs` | Real GeoGuessr socket flow test (skips without a Maps key) |
 | `npx tsx scripts/resolvePanos.ts` | Bake Street View panorama ids into the pool |
-| `./deploy.sh`      | Build `linux/amd64` image + push to Docker Hub |
+| `./deploy.sh`      | Build `linux/amd64` image + push to ghcr.io    |
 | `./deploy.sh --local` | Build & run locally via docker compose      |
 
 ## Tech
