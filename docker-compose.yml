@@ -5,7 +5,7 @@
 #   2. docker compose up -d --build
 #
 # Front it with nginx (see README "Deploy" section): route /socket.io/ -> 3001
-# and everything else -> 3000 on https://devsocial.adaptivesoftware.co.
+# and everything else -> 3000 on https://dev-social.adaptivesoftware.co.
 
 services:
   devsocial:
@@ -14,7 +14,7 @@ services:
       args:
         # NEXT_PUBLIC_* are inlined into the browser bundle at BUILD time.
         # These are public/non-secret values.
-        NEXT_PUBLIC_GAME_SERVER_URL: "https://devsocial.adaptivesoftware.co"
+        NEXT_PUBLIC_GAME_SERVER_URL: "https://dev-social.adaptivesoftware.co"
         NEXT_PUBLIC_SUPABASE_URL: "https://dlfjcxnnmtkzupvhdivw.supabase.co"
         NEXT_PUBLIC_SUPABASE_ANON_KEY: "sb_publishable_BKDF8Jx85S4jPZy7UUembg_vQK2GW6g"
         # Browser key for the Real GeoGuessr game (Street View + guess map).
@@ -31,7 +31,7 @@ services:
     environment:
       NODE_ENV: production
       # Lock CORS on the realtime server to your public origin (was "*").
-      GAME_CLIENT_ORIGIN: "https://devsocial.adaptivesoftware.co"
+      GAME_CLIENT_ORIGIN: "https://dev-social.adaptivesoftware.co"
       # Server-side Supabase access (writes + photo uploads).
       SUPABASE_URL: "https://dlfjcxnnmtkzupvhdivw.supabase.co"
       # Optional: unrestricted key so the server can resolve GeoGuessr panorama
