@@ -187,39 +187,43 @@ echo -e "  5. Stop/remove any old container (if it exists):"
 echo ""
 echo -e "     ${GREEN}docker rm -f ${IMAGE_NAME} 2>/dev/null || true${NC}"
 echo ""
-echo -e "  6. Run the container:"
+echo -e "  6. Run the container (copy/paste this whole block):"
 echo ""
-echo -e "     ${GREEN}SERVICE_ROLE=\$(cat ${UNRAID_APPDATA}/service_role)${NC}"
-echo -e "     ${GREEN}docker run -d \\${NC}"
-echo -e "     ${GREEN}  --name ${IMAGE_NAME} \\${NC}"
-echo -e "     ${GREEN}  --restart unless-stopped \\${NC}"
-echo -e "     ${GREEN}  -p ${NEXT_PORT}:3000 \\${NC}"
-echo -e "     ${GREEN}  -p ${GAME_PORT}:3001 \\${NC}"
-echo -e "     ${GREEN}  -e NODE_ENV=production \\${NC}"
-echo -e "     ${GREEN}  -e GAME_CLIENT_ORIGIN='${PUBLIC_ORIGIN}' \\${NC}"
-echo -e "     ${GREEN}  -e SUPABASE_URL='${SUPABASE_URL}' \\${NC}"
-echo -e "     ${GREEN}  -e SUPABASE_SERVICE_ROLE_KEY=\"\$SERVICE_ROLE\" \\${NC}"
-echo -e "     ${GREEN}  ${IMAGE}${NC}"
+cat <<EOF
+SERVICE_ROLE=\$(cat ${UNRAID_APPDATA}/service_role)
+docker run -d \\
+  --name ${IMAGE_NAME} \\
+  --restart unless-stopped \\
+  -p ${NEXT_PORT}:3000 \\
+  -p ${GAME_PORT}:3001 \\
+  -e NODE_ENV=production \\
+  -e GAME_CLIENT_ORIGIN='${PUBLIC_ORIGIN}' \\
+  -e SUPABASE_URL='${SUPABASE_URL}' \\
+  -e SUPABASE_SERVICE_ROLE_KEY="\$SERVICE_ROLE" \\
+  ${IMAGE}
+EOF
 echo ""
 echo -e "  7. Watch logs:"
 echo ""
 echo -e "     ${GREEN}docker logs -f ${IMAGE_NAME}${NC}"
 echo ""
-echo -e "${YELLOW}TO UPDATE (after future deploys):${NC}"
+echo -e "${YELLOW}TO UPDATE (after future deploys) — copy/paste this whole block:${NC}"
 echo ""
-echo -e "     ${GREEN}docker pull ${IMAGE}${NC}"
-echo -e "     ${GREEN}docker rm -f ${IMAGE_NAME} 2>/dev/null || true${NC}"
-echo -e "     ${GREEN}SERVICE_ROLE=\$(cat ${UNRAID_APPDATA}/service_role)${NC}"
-echo -e "     ${GREEN}docker run -d \\${NC}"
-echo -e "     ${GREEN}  --name ${IMAGE_NAME} \\${NC}"
-echo -e "     ${GREEN}  --restart unless-stopped \\${NC}"
-echo -e "     ${GREEN}  -p ${NEXT_PORT}:3000 \\${NC}"
-echo -e "     ${GREEN}  -p ${GAME_PORT}:3001 \\${NC}"
-echo -e "     ${GREEN}  -e NODE_ENV=production \\${NC}"
-echo -e "     ${GREEN}  -e GAME_CLIENT_ORIGIN='${PUBLIC_ORIGIN}' \\${NC}"
-echo -e "     ${GREEN}  -e SUPABASE_URL='${SUPABASE_URL}' \\${NC}"
-echo -e "     ${GREEN}  -e SUPABASE_SERVICE_ROLE_KEY=\"\$SERVICE_ROLE\" \\${NC}"
-echo -e "     ${GREEN}  ${IMAGE}${NC}"
+cat <<EOF
+docker pull ${IMAGE}
+docker rm -f ${IMAGE_NAME} 2>/dev/null || true
+SERVICE_ROLE=\$(cat ${UNRAID_APPDATA}/service_role)
+docker run -d \\
+  --name ${IMAGE_NAME} \\
+  --restart unless-stopped \\
+  -p ${NEXT_PORT}:3000 \\
+  -p ${GAME_PORT}:3001 \\
+  -e NODE_ENV=production \\
+  -e GAME_CLIENT_ORIGIN='${PUBLIC_ORIGIN}' \\
+  -e SUPABASE_URL='${SUPABASE_URL}' \\
+  -e SUPABASE_SERVICE_ROLE_KEY="\$SERVICE_ROLE" \\
+  ${IMAGE}
+EOF
 echo ""
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}   🌐 nginx: /socket.io/ -> :${GAME_PORT}, everything else -> :${NEXT_PORT}${NC}"
