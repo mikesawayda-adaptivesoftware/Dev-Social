@@ -42,6 +42,7 @@ export function Lobby() {
     GEO_DEFAULT_DURATION_SEC
   );
   const [hostPlaying, setHostPlaying] = useState(false);
+  const [copied, setCopied] = useState(false);
 
   if (!state) {
     return null;
@@ -50,6 +51,30 @@ export function Lobby() {
   const joinUrl = origin ? `${origin}/join?code=${state.code}` : "";
 
   const notEnough = state.players.length < 2;
+
+  async function copyLink() {
+    if (!joinUrl) return;
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(joinUrl);
+      } else {
+        // Fallback for non-secure contexts (e.g. plain-http LAN access), where
+        // navigator.clipboard is unavailable.
+        const ta = document.createElement("textarea");
+        ta.value = joinUrl;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Clipboard blocked (rare) — the link stays on screen to copy manually.
+    }
+  }
 
   async function start() {
     setBusy(true);
@@ -70,12 +95,31 @@ export function Lobby() {
   return (
     <div className="mx-auto w-full max-w-2xl px-5 py-10 text-center">
       <RoomCodeBadge code={state.code} />
-      <p className="mt-3 text-white/60">
-        Join at{" "}
-        <span className="font-semibold text-white">
-          {joinUrl.replace(/^https?:\/\//, "")}
-        </span>
-      </p>
+
+      <div className="mt-4 flex flex-col items-center gap-2">
+        <span className="text-sm text-white/50">Players join at</span>
+        <button
+          type="button"
+          onClick={copyLink}
+          disabled={!joinUrl}
+          title="Click to copy the join link"
+          aria-label={copied ? "Join link copied" : "Copy join link"}
+          className="group flex max-w-full items-center gap-3 rounded-2xl border-2 border-white/10 bg-white/5 px-4 py-3 font-semibold text-white transition-all hover:border-fuchsia-400 hover:bg-fuchsia-400/10 disabled:opacity-50"
+        >
+          <span className="truncate">
+            {joinUrl.replace(/^https?:\/\//, "")}
+          </span>
+          <span
+            className={`shrink-0 rounded-lg px-3 py-1 text-xs font-bold uppercase tracking-wide transition-colors ${
+              copied
+                ? "bg-green-500 text-white"
+                : "bg-fuchsia-500/80 text-white group-hover:bg-fuchsia-500"
+            }`}
+          >
+            {copied ? "✓ Copied" : "Copy"}
+          </span>
+        </button>
+      </div>
 
       <div className="card mt-8 p-6">
         <h2 className="mb-4 text-lg font-bold text-white/80">
