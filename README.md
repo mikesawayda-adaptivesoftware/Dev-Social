@@ -354,11 +354,32 @@ docker run -d --name dev-social --restart unless-stopped \
   -e GAME_CLIENT_ORIGIN='https://dev-social.adaptivesoftware.co' \
   -e SUPABASE_URL='https://dlfjcxnnmtkzupvhdivw.supabase.co' \
   -e SUPABASE_SERVICE_ROLE_KEY="$SERVICE_ROLE" \
+  -e GOOGLE_MAPS_API_KEY='your-server-maps-key' \
   ghcr.io/mikesawayda-adaptivesoftware/dev-social:latest
 ```
 
+(`deploy.sh` adds the `GOOGLE_MAPS_API_KEY` line automatically when it's set in
+`.env`; drop it if you're not using Real GeoGuessr.)
+
 To update after a future `./deploy.sh`: re-run steps 3 (pull → rm → run); the
 saved `service_role` file is reused.
+
+#### Real GeoGuessr needs **two** Maps keys
+
+GeoGuessr is the only feature that needs Google Maps, and it uses two keys with
+**different** restriction requirements — a common footgun:
+
+| Key | Set as | Used by | Google restriction |
+| --- | ------ | ------- | ------------------ |
+| `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` | **build arg** (baked) | Browser: renders Street View + guess map | HTTP-referrer restricted (your domain + localhost); needs **Maps JavaScript API** |
+| `GOOGLE_MAPS_API_KEY` | **runtime `-e`** | Server: resolves Street View panorama IDs | **No referrer restriction** (server calls have no referrer) — leave unrestricted or IP-restrict; needs **Street View Static API** |
+
+> **Don't reuse one referrer-restricted key for both.** The server key must not be
+> referrer-restricted or every panorama lookup is rejected and you get *"Couldn't
+> load any Street View locations."* The browser key is baked at build time, so
+> changing it requires a rebuild (`./deploy.sh`); the server key is runtime-only.
+> You can pre-bake panorama IDs instead with `npx tsx scripts/resolvePanos.ts` to
+> avoid the server needing a key at all.
 
 ### Reverse proxy: Cloudflare + Nginx Proxy Manager
 
@@ -483,6 +504,7 @@ server {
 | NPM save → *Internal Error*; `nginx -t` shows `"proxy_http_version" directive is duplicate` | Remove `proxy_http_version` from the `/socket.io/` advanced box — the Websockets Support toggle already adds it |
 | Cloudflare **525** (SSL handshake failed) | Origin TLS not active — NPM proxy host has no cert, or its config failed to reload (see the duplicate-directive row above) |
 | GeoGuessr shows a setup hint | No `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` was set at **build** time — add it to `.env` and re-run `./deploy.sh` (it's baked, not runtime) |
+| GeoGuessr: *Couldn't load any Street View locations… configured for the server* | Server `GOOGLE_MAPS_API_KEY` missing, referrer-restricted, or lacking the Street View Static API — set an **unrestricted** server key and redeploy |
 | Leaderboard errors / no persistence | `SUPABASE_SERVICE_ROLE_KEY` missing on the container, or migrations not applied to the project |
 
 ## Scripts

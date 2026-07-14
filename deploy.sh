@@ -161,6 +161,18 @@ if [ -z "$SUPABASE_SERVICE_ROLE_KEY" ]; then
     echo ""
 fi
 
+# Optional server-side Maps key (GeoGuessr panorama resolution). Injected into
+# the printed run command only when present in .env / the shell.
+if [ -n "${GOOGLE_MAPS_API_KEY:-}" ]; then
+    MAPS_RUN_LINE="  -e GOOGLE_MAPS_API_KEY='${GOOGLE_MAPS_API_KEY}' \\
+"
+else
+    MAPS_RUN_LINE=""
+    echo -e "${YELLOW}ℹ️  No server GOOGLE_MAPS_API_KEY in .env — Real GeoGuessr can't load${NC}"
+    echo -e "${YELLOW}   Street View locations until it's set (add it to .env and redeploy).${NC}"
+    echo ""
+fi
+
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}   🖥️  UNRAID SETUP INSTRUCTIONS${NC}"
 echo -e "${BLUE}========================================${NC}"
@@ -200,7 +212,7 @@ docker run -d \\
   -e GAME_CLIENT_ORIGIN='${PUBLIC_ORIGIN}' \\
   -e SUPABASE_URL='${SUPABASE_URL}' \\
   -e SUPABASE_SERVICE_ROLE_KEY="\$SERVICE_ROLE" \\
-  ${IMAGE}
+${MAPS_RUN_LINE}  ${IMAGE}
 EOF
 echo ""
 echo -e "  7. Watch logs:"
@@ -222,7 +234,7 @@ docker run -d \\
   -e GAME_CLIENT_ORIGIN='${PUBLIC_ORIGIN}' \\
   -e SUPABASE_URL='${SUPABASE_URL}' \\
   -e SUPABASE_SERVICE_ROLE_KEY="\$SERVICE_ROLE" \\
-  ${IMAGE}
+${MAPS_RUN_LINE}  ${IMAGE}
 EOF
 echo ""
 echo -e "${BLUE}========================================${NC}"
