@@ -25,12 +25,10 @@ cd /Users/msawayda/test_stuff/Dev-Social
 
 **Nginx Proxy Manager** — one proxy host:
 - Details: `dev-social.adaptivesoftware.co` → `http` `192.168.0.248:3092`, **Websockets ON**
-- Custom Locations: `/socket.io/` → `http` `192.168.0.248:3093`, gear ⚙️:
+- Custom Locations: `/socket.io/` → `http` `192.168.0.248:3093`. In the gear ⚙️
+  box put **only** the timeouts (Websockets Support adds the upgrade headers; a
+  2nd `proxy_http_version` breaks nginx → Internal Error / 525):
   ```nginx
-  proxy_http_version 1.1;
-  proxy_set_header Upgrade $http_upgrade;
-  proxy_set_header Connection "upgrade";
-  proxy_set_header Host $host;
   proxy_read_timeout 86400s;
   proxy_send_timeout 86400s;
   ```
@@ -76,7 +74,8 @@ SERVICE_ROLE=$(cat /mnt/user/appdata/dev-social/service_role)
 ## Gotchas
 | Symptom | Fix |
 | ------- | --- |
-| Page loads, games never connect | NPM `/socket.io/` → `:3093` w/ upgrade headers; baked origin must match domain |
+| Page loads, games never connect | NPM `/socket.io/` → `:3093`, Websockets Support ON; baked origin must match domain |
+| NPM *Internal Error* on save / Cloudflare 525 | Duplicate `proxy_http_version` in the `/socket.io/` advanced box — delete it (the Websockets toggle adds it) |
 | `ERR_TOO_MANY_REDIRECTS` | Cloudflare SSL/TLS mode → **Full** |
 | `docker pull` denied | ghcr package is private → `docker login` or make it public |
 | GeoGuessr shows setup hint | Set `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` in `.env` and re-run `./deploy.sh` (baked at build, not runtime) |

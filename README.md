@@ -393,16 +393,19 @@ apply to them).
 - **Details tab** — Domain `dev-social.adaptivesoftware.co`, Scheme `http`,
   Forward Hostname/IP `192.168.0.248`, Forward Port `3092`, **Websockets Support ON**.
 - **Custom Locations tab** — add location `/socket.io/`, Scheme `http`, Forward
-  `192.168.0.248`, Port `3093`. Click the ⚙️ gear and paste:
+  `192.168.0.248`, Port `3093`. Click the ⚙️ gear and paste **only** the
+  timeouts:
 
   ```nginx
-  proxy_http_version 1.1;
-  proxy_set_header Upgrade $http_upgrade;
-  proxy_set_header Connection "upgrade";
-  proxy_set_header Host $host;
   proxy_read_timeout 86400s;
   proxy_send_timeout 86400s;
   ```
+
+  Do **not** add `proxy_http_version`/`Upgrade`/`Connection` here. The
+  **Websockets Support** toggle already injects those into every location, and a
+  second `proxy_http_version` makes nginx fail to load with `"proxy_http_version"
+  directive is duplicate` — the save throws *Internal Error* and the SSL block
+  never activates (→ Cloudflare 525).
 
 - **SSL tab** — request a Let's Encrypt cert, Force SSL on. If issuance fails
   while Cloudflare is proxying (the HTTP-01 challenge is blocked), set the CF
@@ -477,6 +480,8 @@ server {
 | Page loads, but "connecting…" never resolves / games don't start | Socket blocked — check the NPM `/socket.io/` location points at `:3093` with the upgrade headers, and the baked origin matches the domain |
 | Redirect loop / `ERR_TOO_MANY_REDIRECTS` | Cloudflare SSL/TLS mode is *Flexible* — set it to *Full* |
 | `docker pull` denied on Unraid | Package is private — `docker login ghcr.io` (step 1) or make the ghcr package public |
+| NPM save → *Internal Error*; `nginx -t` shows `"proxy_http_version" directive is duplicate` | Remove `proxy_http_version` from the `/socket.io/` advanced box — the Websockets Support toggle already adds it |
+| Cloudflare **525** (SSL handshake failed) | Origin TLS not active — NPM proxy host has no cert, or its config failed to reload (see the duplicate-directive row above) |
 | GeoGuessr shows a setup hint | No `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` was set at **build** time — add it to `.env` and re-run `./deploy.sh` (it's baked, not runtime) |
 | Leaderboard errors / no persistence | `SUPABASE_SERVICE_ROLE_KEY` missing on the container, or migrations not applied to the project |
 
