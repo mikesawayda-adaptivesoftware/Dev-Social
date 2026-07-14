@@ -44,13 +44,13 @@ const main = async () => {
     sock._label = label;
   }
 
-  const created = await emit(a, "room:create", { name: "Alice" });
+  const created = await emit(a, "room:create", { name: "Alice", pin: "1111" });
   ids.a = created.playerId;
   const code = created.code;
   console.log("created room", code);
 
-  const jb = await emit(b, "room:join", { code, name: "Bob" });
-  const jc = await emit(c, "room:join", { code, name: "Cara" });
+  const jb = await emit(b, "room:join", { code, name: "Bob", pin: "2222" });
+  const jc = await emit(c, "room:join", { code, name: "Cara", pin: "3333" });
   ids.b = jb.playerId;
   ids.c = jc.playerId;
   console.log("joined: Bob, Cara");

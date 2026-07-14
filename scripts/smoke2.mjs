@@ -23,10 +23,10 @@ const main = async () => {
   const [a, b] = await Promise.all([connect(), connect()]);
   const me = {};
 
-  const created = await emit(a, "room:create", { name: "Alice" });
+  const created = await emit(a, "room:create", { name: "Alice", pin: "1111" });
   me[a.id] = created.playerId;
   const code = created.code;
-  const jb = await emit(b, "room:join", { code, name: "Bob" });
+  const jb = await emit(b, "room:join", { code, name: "Bob", pin: "2222" });
   me[b.id] = jb.playerId;
 
   for (const sock of [a, b]) {

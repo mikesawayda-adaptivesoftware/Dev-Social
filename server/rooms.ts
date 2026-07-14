@@ -1,12 +1,19 @@
 import { nanoid } from "nanoid";
 import {
   DEFAULT_SETTINGS,
+  GEO_DEFAULT_DURATION_SEC,
   type GameSettings,
   type GamePhase,
+  type GameType,
   type RoomState,
   type PublicPlayer,
 } from "../src/shared/types";
-import type { FinishedGame } from "./supabase";
+import { GEO_LOCATIONS, resolvePano } from "./geoLocations";
+import {
+  claimOrVerifyName,
+  getSeenCounts,
+  type FinishedGame,
+} from "./supabase";
 
 const PLAYER_COLORS = [
   "#f87171", // red
@@ -55,18 +62,73 @@ interface InternalRound {
   closed: boolean;
 }
 
+interface GeoGuess {
+  lat: number;
+  lng: number;
+  distanceKm: number;
+  points: number;
+  timeMs: number;
+}
+
+interface GeoRound {
+  id: string;
+  locationId: string;
+  // Answer coordinates (the panorama's actual location) + label. Never sent to
+  // clients until the reveal phase.
+  lat: number;
+  lng: number;
+  label: string;
+  panoId: string;
+  guesses: Map<string, GeoGuess>;
+  startedAt: number;
+  durationMs: number;
+  closed: boolean;
+}
+
 interface Room {
   code: string;
   hostId: string;
   phase: GamePhase;
+  gameType: GameType;
+  // Whether the host competes. When false the host is a pure spectator (runs the
+  // big screen) and is hidden from scoreboards, rankings, and persistence.
+  hostPlaying: boolean;
   settings: GameSettings;
   players: Map<string, InternalPlayer>;
   photos: InternalPhoto[];
   rounds: InternalRound[];
+  geoRounds: GeoRound[];
   currentRound: number;
   roundTimer?: ReturnType<typeof setTimeout>;
   createdAt: number;
   persisted: boolean;
+}
+
+const MAX_GEO_POINTS = 5000;
+// Distance (km) scale for the exponential score decay. Larger = more forgiving.
+const GEO_SCORE_SCALE_KM = 1500;
+
+/** Great-circle distance between two lat/lng points, in kilometers. */
+function haversineKm(
+  aLat: number,
+  aLng: number,
+  bLat: number,
+  bLng: number
+): number {
+  const R = 6371; // Earth radius, km
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(bLat - aLat);
+  const dLng = toRad(bLng - aLng);
+  const lat1 = toRad(aLat);
+  const lat2 = toRad(bLat);
+  const h =
+    Math.sin(dLat / 2) ** 2 +
+    Math.sin(dLng / 2) ** 2 * Math.cos(lat1) * Math.cos(lat2);
+  return 2 * R * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+function geoPoints(distanceKm: number): number {
+  return Math.round(MAX_GEO_POINTS * Math.exp(-distanceKm / GEO_SCORE_SCALE_KM));
 }
 
 export class RoomError extends Error {}
@@ -126,17 +188,33 @@ export class RoomStore {
     }
   }
 
-  createRoom(name: string): { code: string; playerId: string } {
+  /** A player who is in the room but not competing (a non-playing host). */
+  private isSpectator(room: Room, playerId: string): boolean {
+    return playerId === room.hostId && !room.hostPlaying;
+  }
+
+  async createRoom(
+    name: string,
+    pin: string
+  ): Promise<{ code: string; playerId: string }> {
+    validatePin(pin);
+    const claim = await claimOrVerifyName(cleanName(name) || "Host", pin);
+    if (!claim.ok) {
+      throw new RoomError(claim.reason);
+    }
     const code = makeCode(new Set(this.rooms.keys()));
     const playerId = nanoid(10);
     const room: Room = {
       code,
       hostId: playerId,
       phase: "lobby",
+      gameType: "photo_guessr",
+      hostPlaying: false,
       settings: { ...DEFAULT_SETTINGS },
       players: new Map(),
       photos: [],
       rounds: [],
+      geoRounds: [],
       currentRound: 0,
       createdAt: Date.now(),
       persisted: false,
@@ -153,13 +231,22 @@ export class RoomStore {
     return { code, playerId };
   }
 
-  joinRoom(code: string, name: string): { code: string; playerId: string } {
+  async joinRoom(
+    code: string,
+    name: string,
+    pin: string
+  ): Promise<{ code: string; playerId: string }> {
     const room = this.requireRoom(code);
     if (room.phase !== "lobby") {
       throw new RoomError("This game has already started.");
     }
     if (room.players.size >= PLAYER_COLORS.length) {
       throw new RoomError("This room is full.");
+    }
+    validatePin(pin);
+    const claim = await claimOrVerifyName(cleanName(name) || "Player", pin);
+    if (!claim.ok) {
+      throw new RoomError(claim.reason);
     }
     const playerId = nanoid(10);
     const color = PLAYER_COLORS[room.players.size % PLAYER_COLORS.length];
@@ -293,9 +380,143 @@ export class RoomStore {
     this.beginRound(room);
   }
 
+  /**
+   * Host-only. Start a Real GeoGuessr game from the lobby. Picks a fresh set of
+   * curated locations, resolves each to a Street View panorama id (so the answer
+   * coordinates never reach the browser), and begins the first round. Async
+   * because panorama resolution may hit the metadata API on first use.
+   */
+  async startGeoGame(
+    code: string,
+    playerId: string,
+    roundDurationSec: number,
+    hostPlaying: boolean
+  ) {
+    const room = this.requireRoom(code);
+    this.requireHost(room, playerId);
+    if (room.phase !== "lobby") {
+      throw new RoomError("You can only start a game from the lobby.");
+    }
+    if (room.players.size < 2) {
+      throw new RoomError("Need at least 2 players to start.");
+    }
+    // At least one competitor is required (if the host sits out, someone else
+    // must be playing).
+    const competitors = hostPlaying
+      ? room.players.size
+      : room.players.size - 1;
+    if (competitors < 1) {
+      throw new RoomError("Need at least one player besides the host.");
+    }
+    const duration = Number.isFinite(roundDurationSec)
+      ? Math.max(30, Math.min(300, Math.round(roundDurationSec)))
+      : GEO_DEFAULT_DURATION_SEC;
+    const count = Math.max(1, room.settings.geoRoundCount);
+
+    // Soft-prefer locations the current competitors haven't seen before. We
+    // shuffle first (random tie-break), then stable-sort by how many of them
+    // have already seen each spot. This never blocks: once everyone has seen
+    // everything, it simply falls back to the least-seen locations.
+    const competitorNames = [...room.players.values()]
+      .filter((p) => !this.isSpectator(room, p.id))
+      .map((p) => p.name);
+    const seenCounts = await getSeenCounts(competitorNames);
+    const pool = shuffle(GEO_LOCATIONS).sort(
+      (a, b) => (seenCounts.get(a.id) ?? 0) - (seenCounts.get(b.id) ?? 0)
+    );
+    const rounds: GeoRound[] = [];
+    for (const loc of pool) {
+      if (rounds.length >= count) {
+        break;
+      }
+      const resolved = await resolvePano(loc);
+      if (!resolved) {
+        continue;
+      }
+      rounds.push({
+        id: nanoid(8),
+        locationId: loc.id,
+        lat: resolved.lat,
+        lng: resolved.lng,
+        label: loc.label,
+        panoId: resolved.panoId,
+        guesses: new Map<string, GeoGuess>(),
+        startedAt: 0,
+        durationMs: duration * 1000,
+        closed: false,
+      });
+    }
+
+    if (rounds.length === 0) {
+      throw new RoomError(
+        "Couldn't load any Street View locations. Check that a Google Maps API key is configured for the server."
+      );
+    }
+
+    room.gameType = "geo_guessr";
+    room.hostPlaying = hostPlaying;
+    room.settings.roundDurationSec = duration;
+    room.geoRounds = rounds;
+    room.rounds = [];
+    room.photos = [];
+    room.currentRound = 0;
+    for (const p of room.players.values()) {
+      p.score = 0;
+    }
+    this.beginRound(room);
+  }
+
+  submitGeoGuess(code: string, playerId: string, lat: number, lng: number) {
+    const room = this.requireRoom(code);
+    if (room.gameType !== "geo_guessr" || room.phase !== "playing") {
+      throw new RoomError("There's nothing to guess right now.");
+    }
+    if (!room.players.has(playerId)) {
+      throw new RoomError("You are not in this room.");
+    }
+    if (this.isSpectator(room, playerId)) {
+      throw new RoomError("You're spectating this game — sit back and watch!");
+    }
+    if (
+      !Number.isFinite(lat) ||
+      !Number.isFinite(lng) ||
+      lat < -90 ||
+      lat > 90 ||
+      lng < -180 ||
+      lng > 180
+    ) {
+      throw new RoomError("That doesn't look like a valid spot on the map.");
+    }
+    const round = room.geoRounds[room.currentRound];
+    if (round.guesses.has(playerId)) {
+      return; // already answered; ignore
+    }
+    const elapsed = Date.now() - round.startedAt;
+    const distanceKm = haversineKm(lat, lng, round.lat, round.lng);
+    round.guesses.set(playerId, {
+      lat,
+      lng,
+      distanceKm,
+      points: geoPoints(distanceKm),
+      timeMs: elapsed,
+    });
+
+    // Auto-close once every competitor has locked in a guess.
+    const eligible = [...room.players.keys()].filter(
+      (id) => !this.isSpectator(room, id)
+    );
+    if (eligible.length > 0 && eligible.every((id) => round.guesses.has(id))) {
+      this.closeRound(room);
+    }
+    this.touch(room);
+  }
+
   private beginRound(room: Room) {
     room.phase = "playing";
-    const round = room.rounds[room.currentRound];
+    const round =
+      room.gameType === "geo_guessr"
+        ? room.geoRounds[room.currentRound]
+        : room.rounds[room.currentRound];
     round.startedAt = Date.now();
     round.closed = false;
     if (room.roundTimer) {
@@ -348,6 +569,26 @@ export class RoomStore {
   }
 
   private closeRound(room: Room) {
+    if (room.gameType === "geo_guessr") {
+      const round = room.geoRounds[room.currentRound];
+      if (!round || round.closed) {
+        return;
+      }
+      round.closed = true;
+      if (room.roundTimer) {
+        clearTimeout(room.roundTimer);
+        room.roundTimer = undefined;
+      }
+      for (const [playerId, guess] of round.guesses) {
+        const player = room.players.get(playerId);
+        if (player) {
+          player.score += guess.points;
+        }
+      }
+      room.phase = "reveal";
+      return;
+    }
+
     const round = room.rounds[room.currentRound];
     if (round.closed) {
       return;
@@ -372,7 +613,11 @@ export class RoomStore {
     if (room.phase !== "reveal") {
       throw new RoomError("Finish revealing first.");
     }
-    if (room.currentRound + 1 >= room.rounds.length) {
+    const total =
+      room.gameType === "geo_guessr"
+        ? room.geoRounds.length
+        : room.rounds.length;
+    if (room.currentRound + 1 >= total) {
       room.phase = "final";
       this.touch(room);
       this.onGameFinished(room.code);
@@ -392,8 +637,10 @@ export class RoomStore {
     room.phase = "lobby";
     room.photos = [];
     room.rounds = [];
+    room.geoRounds = [];
     room.currentRound = 0;
     room.persisted = false;
+    room.hostPlaying = false;
     for (const p of room.players.values()) {
       p.score = 0;
     }
@@ -412,14 +659,18 @@ export class RoomStore {
     }
     room.persisted = true;
     const host = room.players.get(room.hostId);
-    const ranked = [...room.players.values()].sort(
-      (a, b) => b.score - a.score
-    );
+    const ranked = [...room.players.values()]
+      .filter((p) => !this.isSpectator(room, p.id))
+      .sort((a, b) => b.score - a.score);
+    const roundCount =
+      room.gameType === "geo_guessr"
+        ? room.geoRounds.length
+        : room.rounds.length;
     return {
       code: room.code,
-      gameType: "photo_guessr",
+      gameType: room.gameType,
       hostName: host?.name ?? "Host",
-      roundCount: room.rounds.length,
+      roundCount,
       players: ranked.map((p, i) => ({
         name: p.name,
         color: p.color,
@@ -427,6 +678,10 @@ export class RoomStore {
         placement: i + 1,
         isHost: p.isHost,
       })),
+      geoLocationIds:
+        room.gameType === "geo_guessr"
+          ? room.geoRounds.map((r) => r.locationId)
+          : undefined,
     };
   }
 
@@ -451,15 +706,73 @@ export class RoomStore {
       isHost: p.isHost,
       connected: p.connected,
       photoCount: photoCounts.get(p.id) ?? 0,
+      spectator: this.isSpectator(room, p.id),
     }));
 
     const state: RoomState = {
       code: room.code,
       phase: room.phase,
+      gameType: room.gameType,
       hostId: room.hostId,
       players,
       settings: room.settings,
     };
+
+    if (room.gameType === "geo_guessr") {
+      const competitorCount = [...room.players.keys()].filter(
+        (id) => !this.isSpectator(room, id)
+      ).length;
+
+      if (room.phase === "playing") {
+        const round = room.geoRounds[room.currentRound];
+        const myGuess = round.guesses.get(viewerId);
+        state.geoRound = {
+          index: room.currentRound,
+          total: room.geoRounds.length,
+          panoId: round.panoId,
+          endsAt: round.startedAt + round.durationMs,
+          answeredCount: round.guesses.size,
+          guessCount: competitorCount,
+          iGuessed: round.guesses.has(viewerId),
+          myGuess: myGuess ? { lat: myGuess.lat, lng: myGuess.lng } : undefined,
+          isHost: viewerId === room.hostId,
+          spectating: this.isSpectator(room, viewerId),
+        };
+      }
+
+      if (room.phase === "reveal") {
+        const round = room.geoRounds[room.currentRound];
+        const results = [...room.players.values()]
+          .filter((p) => !this.isSpectator(room, p.id))
+          .map((p) => {
+            const g = round.guesses.get(p.id);
+            return {
+              playerId: p.id,
+              guess: g ? { lat: g.lat, lng: g.lng } : null,
+              distanceKm: g ? g.distanceKm : null,
+              points: g ? g.points : 0,
+            };
+          });
+        state.geoReveal = {
+          index: room.currentRound,
+          total: room.geoRounds.length,
+          panoId: round.panoId,
+          answer: { lat: round.lat, lng: round.lng, label: round.label },
+          results,
+        };
+      }
+
+      if (room.phase === "final") {
+        state.final = {
+          ranking: [...room.players.values()]
+            .filter((p) => !this.isSpectator(room, p.id))
+            .sort((a, b) => b.score - a.score)
+            .map((p) => ({ playerId: p.id, score: p.score })),
+        };
+      }
+
+      return state;
+    }
 
     if (room.phase === "submission") {
       state.submission = {
@@ -506,6 +819,7 @@ export class RoomStore {
     if (room.phase === "final") {
       state.final = {
         ranking: [...room.players.values()]
+          .filter((p) => !this.isSpectator(room, p.id))
           .sort((a, b) => b.score - a.score)
           .map((p) => ({ playerId: p.id, score: p.score })),
       };
@@ -531,4 +845,11 @@ export class RoomStore {
 
 function cleanName(name: string): string {
   return name.trim().slice(0, 20);
+}
+
+/** PINs are 4-6 digits. Throws a user-facing RoomError when malformed. */
+function validatePin(pin: string): void {
+  if (!/^\d{4,6}$/.test(pin ?? "")) {
+    throw new RoomError("Your PIN must be 4 to 6 digits.");
+  }
 }

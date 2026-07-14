@@ -31,8 +31,9 @@ interface GameContextValue {
   identity: Identity | null;
   me: RoomState["players"][number] | null;
   isHost: boolean;
-  createRoom: (name: string) => Promise<string>;
-  joinRoom: (code: string, name: string) => Promise<string>;
+  createRoom: (name: string, pin: string) => Promise<string>;
+  joinRoom: (code: string, name: string, pin: string) => Promise<string>;
+  checkName: (name: string) => Promise<boolean>;
   rejoin: (code: string) => Promise<void>;
   leave: () => void;
   startSubmission: () => Promise<void>;
@@ -40,6 +41,8 @@ interface GameContextValue {
   clearMyPhotos: () => Promise<void>;
   startGame: () => Promise<void>;
   submitGuess: (choiceId: string) => Promise<void>;
+  startGeoGame: (roundDurationSec: number, hostPlaying: boolean) => Promise<void>;
+  submitGeoGuess: (lat: number, lng: number) => Promise<void>;
   nextRound: () => Promise<void>;
   playAgain: () => Promise<void>;
 }
@@ -53,8 +56,13 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
   const identityRef = useRef<Identity | null>(null);
 
   useEffect(() => {
+    // Seed identity from sessionStorage on mount. This must run in an effect
+    // (not a lazy useState initializer): sessionStorage is unavailable during
+    // SSR, so initializing from it would desync server/client and cause a
+    // hydration mismatch in identity-dependent children.
     const stored = loadIdentity();
     if (stored) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
       setIdentity(stored);
       identityRef.current = stored;
     }
@@ -97,11 +105,11 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const createRoom = useCallback(
-    (name: string) =>
+    (name: string, pin: string) =>
       new Promise<string>((resolve, reject) => {
         getSocket().emit(
           "room:create",
-          { name },
+          { name, pin },
           (res: AckResult<{ code: string; playerId: string }>) => {
             if (res.ok) {
               persist({ code: res.code, playerId: res.playerId, isHost: true, name });
@@ -116,11 +124,11 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
   );
 
   const joinRoom = useCallback(
-    (code: string, name: string) =>
+    (code: string, name: string, pin: string) =>
       new Promise<string>((resolve, reject) => {
         getSocket().emit(
           "room:join",
-          { code: code.toUpperCase(), name },
+          { code: code.toUpperCase(), name, pin },
           (res: AckResult<{ code: string; playerId: string }>) => {
             if (res.ok) {
               persist({ code: res.code, playerId: res.playerId, isHost: false, name });
@@ -132,6 +140,24 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
         );
       }),
     [persist]
+  );
+
+  const checkName = useCallback(
+    (name: string) =>
+      new Promise<boolean>((resolve) => {
+        if (!name.trim()) {
+          resolve(false);
+          return;
+        }
+        getSocket().emit(
+          "name:check",
+          { name: name.trim() },
+          (res: AckResult<{ claimed: boolean }>) => {
+            resolve(res.ok ? res.claimed : false);
+          }
+        );
+      }),
+    []
   );
 
   const rejoin = useCallback(
@@ -222,6 +248,42 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     []
   );
 
+  const startGeoGame = useCallback(
+    (roundDurationSec: number, hostPlaying: boolean) =>
+      new Promise<void>((resolve, reject) => {
+        getSocket().emit(
+          "host:startGeoGame",
+          { roundDurationSec, hostPlaying },
+          (res: AckResult<{ ok: true }>) => {
+            if (res?.ok) {
+              resolve();
+            } else {
+              reject(new Error(res?.error ?? "Couldn't start the game."));
+            }
+          }
+        );
+      }),
+    []
+  );
+
+  const submitGeoGuess = useCallback(
+    (lat: number, lng: number) =>
+      new Promise<void>((resolve, reject) => {
+        getSocket().emit(
+          "geo:guess",
+          { lat, lng },
+          (res: AckResult<{ ok: true }>) => {
+            if (res?.ok) {
+              resolve();
+            } else {
+              reject(new Error(res?.error ?? "Guess failed."));
+            }
+          }
+        );
+      }),
+    []
+  );
+
   const me = useMemo(() => {
     if (!state || !identity) {
       return null;
@@ -237,6 +299,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     isHost: Boolean(identity?.isHost),
     createRoom,
     joinRoom,
+    checkName,
     rejoin,
     leave,
     startSubmission: () => simpleAction("host:startSubmission"),
@@ -244,6 +307,8 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     clearMyPhotos: () => simpleAction("photo:clearMine"),
     startGame: () => simpleAction("host:startGame"),
     submitGuess,
+    startGeoGame,
+    submitGeoGuess,
     nextRound: () => simpleAction("host:nextRound"),
     playAgain: () => simpleAction("host:playAgain"),
   };

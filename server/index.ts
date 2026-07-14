@@ -4,6 +4,7 @@ import { Server } from "socket.io";
 import { nanoid } from "nanoid";
 import { RoomStore, RoomError } from "./rooms";
 import {
+  isNameClaimed,
   persistFinishedGame,
   supabaseEnabled,
   uploadPhoto,
@@ -87,9 +88,9 @@ function fail(error: unknown): AckResult<never> {
 }
 
 io.on("connection", (socket) => {
-  socket.on("room:create", ({ name }, ack) => {
+  socket.on("room:create", async ({ name, pin }, ack) => {
     try {
-      const { code, playerId } = store.createRoom(name);
+      const { code, playerId } = await store.createRoom(name, pin);
       socket.data.code = code;
       socket.data.playerId = playerId;
       store.attachSocket(code, playerId, socket.id);
@@ -101,9 +102,9 @@ io.on("connection", (socket) => {
     }
   });
 
-  socket.on("room:join", ({ code, name }, ack) => {
+  socket.on("room:join", async ({ code, name, pin }, ack) => {
     try {
-      const res = store.joinRoom(code, name);
+      const res = await store.joinRoom(code, name, pin);
       socket.data.code = res.code;
       socket.data.playerId = res.playerId;
       store.attachSocket(res.code, res.playerId, socket.id);
@@ -112,6 +113,15 @@ io.on("connection", (socket) => {
       broadcastRoom(res.code);
     } catch (err) {
       ack(fail(err) as never);
+    }
+  });
+
+  socket.on("name:check", async ({ name }, ack) => {
+    try {
+      const claimed = await isNameClaimed(name);
+      ack(ok({ claimed }));
+    } catch {
+      ack(ok({ claimed: false }));
     }
   });
 
@@ -179,6 +189,23 @@ io.on("connection", (socket) => {
   );
   socket.on("guess:submit", ({ choiceId }, ack) =>
     withRoom((code, pid) => store.submitGuess(code, pid, choiceId), ack)
+  );
+  socket.on("host:startGeoGame", async ({ roundDurationSec, hostPlaying }, ack) => {
+    const { code, playerId } = socket.data;
+    if (!code || !playerId) {
+      ack?.({ ok: false, error: "You are not in a room." });
+      return;
+    }
+    try {
+      await store.startGeoGame(code, playerId, roundDurationSec, hostPlaying);
+      ack?.(ok({ ok: true as const }));
+      broadcastRoom(code);
+    } catch (err) {
+      ack?.(fail(err) as never);
+    }
+  });
+  socket.on("geo:guess", ({ lat, lng }, ack) =>
+    withRoom((code, pid) => store.submitGeoGuess(code, pid, lat, lng), ack)
   );
   socket.on("host:nextRound", (ack) =>
     withRoom((code, pid) => store.nextRound(code, pid), ack)

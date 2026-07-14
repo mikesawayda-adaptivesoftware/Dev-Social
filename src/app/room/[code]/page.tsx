@@ -8,6 +8,8 @@ import { Submission } from "@/components/game/Submission";
 import { Playing } from "@/components/game/Playing";
 import { Reveal } from "@/components/game/Reveal";
 import { Final } from "@/components/game/Final";
+import { GeoPlaying } from "@/components/game/geo/GeoPlaying";
+import { GeoReveal } from "@/components/game/geo/GeoReveal";
 
 export default function RoomPage() {
   const params = useParams();
@@ -66,9 +68,18 @@ export default function RoomPage() {
 
       <div className="flex flex-1 flex-col">
         {state.phase === "lobby" && <Lobby />}
-        {state.phase === "submission" && <Submission />}
-        {state.phase === "playing" && <Playing />}
-        {state.phase === "reveal" && <Reveal />}
+        {state.gameType === "geo_guessr" ? (
+          <>
+            {state.phase === "playing" && <GeoPlaying />}
+            {state.phase === "reveal" && <GeoReveal />}
+          </>
+        ) : (
+          <>
+            {state.phase === "submission" && <Submission />}
+            {state.phase === "playing" && <Playing />}
+            {state.phase === "reveal" && <Reveal />}
+          </>
+        )}
         {state.phase === "final" && <Final />}
       </div>
     </main>

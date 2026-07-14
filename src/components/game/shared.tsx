@@ -39,7 +39,9 @@ export function Leaderboard({
   meId?: string;
   compact?: boolean;
 }) {
-  const ranked = [...players].sort((a, b) => b.score - a.score);
+  const ranked = [...players]
+    .filter((p) => !p.spectator)
+    .sort((a, b) => b.score - a.score);
   const medals = ["🥇", "🥈", "🥉"];
   return (
     <ol className="space-y-2">

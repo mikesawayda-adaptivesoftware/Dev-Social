@@ -12,7 +12,10 @@ export function Final() {
   const [busy, setBusy] = useState(false);
 
   const ranked = useMemo(
-    () => [...(state?.players ?? [])].sort((a, b) => b.score - a.score),
+    () =>
+      [...(state?.players ?? [])]
+        .filter((p) => !p.spectator)
+        .sort((a, b) => b.score - a.score),
     [state]
   );
 
@@ -68,7 +71,9 @@ export function Final() {
             disabled={busy}
             className="w-full max-w-sm"
           >
-            Play again (new photos) ↻
+            {state.gameType === "geo_guessr"
+              ? "Back to lobby ↻"
+              : "Play again (new photos) ↻"}
           </Button>
         </div>
       )}

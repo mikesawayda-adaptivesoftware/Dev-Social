@@ -4,7 +4,9 @@ import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { Suspense, useState } from "react";
 import { useGame } from "@/components/GameProvider";
+import { NameClaimFields } from "@/components/NameClaimFields";
 import { Button } from "@/components/ui";
+import { PIN_PATTERN } from "@/shared/types";
 
 function JoinForm() {
   const router = useRouter();
@@ -12,6 +14,7 @@ function JoinForm() {
   const { joinRoom, connected } = useGame();
   const [code, setCode] = useState((params.get("code") ?? "").toUpperCase());
   const [name, setName] = useState("");
+  const [pin, setPin] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -24,10 +27,14 @@ function JoinForm() {
       setError("Don't forget your name.");
       return;
     }
+    if (!PIN_PATTERN.test(pin)) {
+      setError("Your PIN must be 4 to 6 digits.");
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
-      const joined = await joinRoom(code.trim(), name.trim());
+      const joined = await joinRoom(code.trim(), name.trim(), pin);
       router.push(`/room/${joined}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't join the room.");
@@ -62,17 +69,13 @@ function JoinForm() {
               className="mt-1.5 w-full rounded-xl border border-white/15 bg-black/20 px-4 py-3 text-center text-3xl font-black tracking-[0.5em] text-white outline-none placeholder:text-white/20 focus:border-fuchsia-400"
             />
           </label>
-          <label className="block text-sm font-medium text-white/70">
-            Your name
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleJoin()}
-              maxLength={20}
-              placeholder="e.g. Sam"
-              className="mt-1.5 w-full rounded-xl border border-white/15 bg-black/20 px-4 py-3 text-lg text-white outline-none placeholder:text-white/30 focus:border-fuchsia-400"
-            />
-          </label>
+          <NameClaimFields
+            name={name}
+            setName={setName}
+            pin={pin}
+            setPin={setPin}
+            onEnter={handleJoin}
+          />
 
           <Button
             onClick={handleJoin}

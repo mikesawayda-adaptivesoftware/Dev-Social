@@ -4,12 +4,15 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useState } from "react";
 import { useGame } from "@/components/GameProvider";
+import { NameClaimFields } from "@/components/NameClaimFields";
 import { Button } from "@/components/ui";
+import { PIN_PATTERN } from "@/shared/types";
 
 export default function Home() {
   const router = useRouter();
   const { createRoom, connected } = useGame();
   const [name, setName] = useState("");
+  const [pin, setPin] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -18,10 +21,14 @@ export default function Home() {
       setError("Enter your name first.");
       return;
     }
+    if (!PIN_PATTERN.test(pin)) {
+      setError("Your PIN must be 4 to 6 digits.");
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
-      const code = await createRoom(name.trim());
+      const code = await createRoom(name.trim(), pin);
       router.push(`/room/${code}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't create the room.");
@@ -47,17 +54,13 @@ export default function Home() {
         </p>
 
         <div className="card mt-10 space-y-4 p-6 text-left">
-          <label className="block text-sm font-medium text-white/70">
-            Your name
-            <input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleHost()}
-              maxLength={20}
-              placeholder="e.g. Alex"
-              className="mt-1.5 w-full rounded-xl border border-white/15 bg-black/20 px-4 py-3 text-lg text-white outline-none placeholder:text-white/30 focus:border-fuchsia-400"
-            />
-          </label>
+          <NameClaimFields
+            name={name}
+            setName={setName}
+            pin={pin}
+            setPin={setPin}
+            onEnter={handleHost}
+          />
 
           <Button
             onClick={handleHost}

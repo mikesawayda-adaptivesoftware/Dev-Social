@@ -17,6 +17,11 @@ services:
         NEXT_PUBLIC_GAME_SERVER_URL: "https://devsocial.adaptivesoftware.co"
         NEXT_PUBLIC_SUPABASE_URL: "https://dlfjcxnnmtkzupvhdivw.supabase.co"
         NEXT_PUBLIC_SUPABASE_ANON_KEY: "sb_publishable_BKDF8Jx85S4jPZy7UUembg_vQK2GW6g"
+        # Browser key for the Real GeoGuessr game (Street View + guess map).
+        # Read from your shell/.env at build time; restrict it by HTTP referrer
+        # in the Google Cloud Console. Empty by default (GeoGuessr shows a setup
+        # hint until it's provided).
+        NEXT_PUBLIC_GOOGLE_MAPS_API_KEY: "${NEXT_PUBLIC_GOOGLE_MAPS_API_KEY:-}"
     image: devsocial:latest
     container_name: devsocial
     restart: unless-stopped
@@ -29,6 +34,9 @@ services:
       GAME_CLIENT_ORIGIN: "https://devsocial.adaptivesoftware.co"
       # Server-side Supabase access (writes + photo uploads).
       SUPABASE_URL: "https://dlfjcxnnmtkzupvhdivw.supabase.co"
+      # Optional: unrestricted key so the server can resolve GeoGuessr panorama
+      # ids at runtime. Not needed if you pre-bake panoIds in geoLocations.ts.
+      GOOGLE_MAPS_API_KEY: "${GOOGLE_MAPS_API_KEY:-}"
     # The service_role secret is injected at runtime from .env (copy from
     # .env.docker.example). Kept out of `environment:` so `docker compose build`
     # doesn't require the secret to be present.

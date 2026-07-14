@@ -20,14 +20,23 @@ export interface SeasonRow {
   total_score: number;
   best_score: number;
   wins: number;
+  avg_score: number;
 }
+
+export type TypeSeasonRow = SeasonRow & { game_type: string };
 
 export interface RecentGame {
   id: string;
   code: string;
+  game_type: string;
   host_name: string;
   player_count: number;
   round_count: number;
   finished_at: string | null;
-  game_players: { name: string; score: number; placement: number }[];
+  game_players: {
+    name: string;
+    color: string;
+    score: number;
+    placement: number;
+  }[];
 }
