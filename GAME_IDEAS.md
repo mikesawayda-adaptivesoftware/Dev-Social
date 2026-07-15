@@ -15,6 +15,8 @@ most of these are "drop-in" games on top of it.
 - ✅ **Photo Guessr / Baby Photo Match** — everyone submits a photo (baby pic,
   etc.); the room competes to match each photo to the right teammate. Points for
   correct + speed.
+- ✅ **Real GeoGuessr-style** — drop into a random Street View, guess the location
+  on a map, score by distance. (Needs a Google Maps API key.)
 - ✅ **Season leaderboard + game history** — cross-game points, wins, recent games
   (persisted in Supabase).
 
@@ -25,10 +27,9 @@ most of these are "drop-in" games on top of it.
 These map directly to the original GeoGuessr inspiration and reuse the
 "show content → everyone guesses → reveal → score" engine.
 
-- 💡 **Real GeoGuessr-style** — drop into a random Street View, guess the location
-  on a map, score by distance. (Needs a Google Maps API key.)
 - 💡 **Photo Guessr variants** — travel photos, pets, childhood homes, desks.
-- 💡 **Price Is Right** — guess the price of weird Amazon products.
+- 🔨 **Price Is Right** — guess the price of weird Amazon products.
+  (Plan: `PRICE_IS_RIGHT_PLAN.md`.)
 - 💡 **Zoomed-In** — extreme close-up of an object/logo, guess what it is.
 - 💡 **Higher or Lower** — Google search volume, populations, box office, etc.
 
