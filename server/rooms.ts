@@ -100,9 +100,17 @@ interface Room {
   geoRounds: GeoRound[];
   currentRound: number;
   roundTimer?: ReturnType<typeof setTimeout>;
+  // When the host is disconnected during a reveal, this timer advances the game
+  // so the remaining players aren't stuck waiting on an absent host. Cancelled
+  // if the host reconnects in time.
+  autoAdvanceTimer?: ReturnType<typeof setTimeout>;
   createdAt: number;
   persisted: boolean;
 }
+
+// How long to hold on a reveal before auto-advancing when the host is gone.
+// Long enough for a brief network blip / page reload to recover control.
+const HOST_ABSENT_REVEAL_MS = 15_000;
 
 const MAX_GEO_POINTS = 5000;
 // Distance (km) scale for the exponential score decay. Larger = more forgiving.
@@ -270,6 +278,12 @@ export class RoomStore {
     }
     player.connected = true;
     player.socketId = socketId;
+    // If the host is coming back, cancel any pending host-absent auto-advance so
+    // they resume control of the reveal.
+    if (player.id === room.hostId && room.autoAdvanceTimer) {
+      clearTimeout(room.autoAdvanceTimer);
+      room.autoAdvanceTimer = undefined;
+    }
     this.touch(room);
     return room;
   }
@@ -501,14 +515,82 @@ export class RoomStore {
       timeMs: elapsed,
     });
 
-    // Auto-close once every competitor has locked in a guess.
-    const eligible = [...room.players.keys()].filter(
-      (id) => !this.isSpectator(room, id)
-    );
-    if (eligible.length > 0 && eligible.every((id) => round.guesses.has(id))) {
+    // Auto-close once every connected competitor has locked in a guess.
+    // Disconnected players are not waited on — otherwise a single dropout would
+    // force every round to run out its full timer.
+    if (this.allConnectedGuessed(room, round)) {
       this.closeRound(room);
     }
     this.touch(room);
+  }
+
+  /**
+   * True when at least one connected competitor exists and all of them have
+   * submitted a guess for `round`. Used to decide when a round can close early.
+   * Works for both geo and photo rounds (both key `guesses` by playerId).
+   */
+  private allConnectedGuessed(
+    room: Room,
+    round: { guesses: Map<string, unknown> }
+  ): boolean {
+    const connected = [...room.players.values()].filter(
+      (p) => p.connected && !this.isSpectator(room, p.id)
+    );
+    return connected.length > 0 && connected.every((p) => round.guesses.has(p.id));
+  }
+
+  /**
+   * Called after a player disconnects. If that leaves the current round in a
+   * state where all remaining connected players have already guessed, close it
+   * early; if the host dropped during a reveal, schedule an auto-advance so the
+   * game doesn't stall.
+   */
+  handleDisconnect(code: string) {
+    const room = this.getRoom(code);
+    if (!room) {
+      return;
+    }
+    if (room.phase === "playing") {
+      const round =
+        room.gameType === "geo_guessr"
+          ? room.geoRounds[room.currentRound]
+          : room.rounds[room.currentRound];
+      if (round && !round.closed && this.allConnectedGuessed(room, round)) {
+        this.closeRound(room);
+      }
+    } else if (room.phase === "reveal") {
+      this.maybeScheduleHostAbsentAdvance(room);
+    }
+  }
+
+  /**
+   * If the host is currently disconnected, arm a timer to advance the game past
+   * the reveal on their behalf. No-op when the host is connected. Safe to call
+   * repeatedly — it only ever keeps one pending timer.
+   */
+  private maybeScheduleHostAbsentAdvance(room: Room) {
+    if (room.phase !== "reveal") {
+      return;
+    }
+    const host = room.players.get(room.hostId);
+    if (host?.connected) {
+      return;
+    }
+    if (room.autoAdvanceTimer) {
+      return; // already armed
+    }
+    room.autoAdvanceTimer = setTimeout(() => {
+      room.autoAdvanceTimer = undefined;
+      // Re-check: the host may have reconnected, or the phase moved on.
+      if (room.phase !== "reveal") {
+        return;
+      }
+      if (room.players.get(room.hostId)?.connected) {
+        return;
+      }
+      this.advanceRound(room);
+      this.onRoomChanged(room.code);
+    }, HOST_ABSENT_REVEAL_MS);
   }
 
   private beginRound(room: Room) {
@@ -521,6 +603,10 @@ export class RoomStore {
     round.closed = false;
     if (room.roundTimer) {
       clearTimeout(room.roundTimer);
+    }
+    if (room.autoAdvanceTimer) {
+      clearTimeout(room.autoAdvanceTimer);
+      room.autoAdvanceTimer = undefined;
     }
     room.roundTimer = setTimeout(() => {
       this.closeRound(room);
@@ -558,11 +644,13 @@ export class RoomStore {
       points,
     });
 
-    // Auto-close once everyone eligible has answered.
-    const eligible = [...room.players.keys()].filter(
-      (id) => id !== round.ownerId
+    // Auto-close once every connected eligible player has answered.
+    // Disconnected players aren't waited on, so one dropout can't force the
+    // round to run out its full timer.
+    const eligible = [...room.players.values()].filter(
+      (p) => p.connected && p.id !== round.ownerId
     );
-    if (eligible.every((id) => round.guesses.has(id))) {
+    if (eligible.length > 0 && eligible.every((p) => round.guesses.has(p.id))) {
       this.closeRound(room);
     }
     this.touch(room);
@@ -586,6 +674,7 @@ export class RoomStore {
         }
       }
       room.phase = "reveal";
+      this.maybeScheduleHostAbsentAdvance(room);
       return;
     }
 
@@ -605,6 +694,7 @@ export class RoomStore {
       }
     }
     room.phase = "reveal";
+    this.maybeScheduleHostAbsentAdvance(room);
   }
 
   nextRound(code: string, playerId: string) {
@@ -612,6 +702,19 @@ export class RoomStore {
     this.requireHost(room, playerId);
     if (room.phase !== "reveal") {
       throw new RoomError("Finish revealing first.");
+    }
+    this.advanceRound(room);
+  }
+
+  /**
+   * Move past the current reveal — to the next round, or to the final scoreboard
+   * if this was the last one. Shared by the host's `nextRound` action and the
+   * host-absent auto-advance timer, so neither carries the host permission check.
+   */
+  private advanceRound(room: Room) {
+    if (room.autoAdvanceTimer) {
+      clearTimeout(room.autoAdvanceTimer);
+      room.autoAdvanceTimer = undefined;
     }
     const total =
       room.gameType === "geo_guessr"
@@ -633,6 +736,10 @@ export class RoomStore {
     if (room.roundTimer) {
       clearTimeout(room.roundTimer);
       room.roundTimer = undefined;
+    }
+    if (room.autoAdvanceTimer) {
+      clearTimeout(room.autoAdvanceTimer);
+      room.autoAdvanceTimer = undefined;
     }
     room.phase = "lobby";
     room.photos = [];
@@ -836,6 +943,9 @@ export class RoomStore {
       if (!anyConnected && now - room.createdAt > ttlMs) {
         if (room.roundTimer) {
           clearTimeout(room.roundTimer);
+        }
+        if (room.autoAdvanceTimer) {
+          clearTimeout(room.autoAdvanceTimer);
         }
         this.rooms.delete(code);
       }

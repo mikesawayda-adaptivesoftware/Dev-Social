@@ -217,6 +217,9 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     const changed = store.markDisconnected(socket.id);
     for (const code of changed) {
+      // A dropout may let the current round close early, or (if the host left)
+      // arm the reveal auto-advance, before we push the updated state.
+      store.handleDisconnect(code);
       broadcastRoom(code);
     }
   });

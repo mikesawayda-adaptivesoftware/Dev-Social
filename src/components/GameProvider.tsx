@@ -11,8 +11,10 @@ import {
 } from "react";
 import {
   clearIdentity,
+  clearRecentSeat,
   getSocket,
   loadIdentity,
+  loadRecentSeat,
   saveIdentity,
   type Identity,
 } from "@/lib/socket";
@@ -35,6 +37,11 @@ interface GameContextValue {
   joinRoom: (code: string, name: string, pin: string) => Promise<string>;
   checkName: (name: string) => Promise<boolean>;
   rejoin: (code: string) => Promise<void>;
+  rejoinRecent: (code: string) => Promise<void>;
+  // True when the server rejected our reconnect (the seat/room is gone, e.g. the
+  // game ended or the server restarted). The room page turns this into a clear
+  // "this game is no longer available" state instead of an endless spinner.
+  seatLost: boolean;
   leave: () => void;
   startSubmission: () => Promise<void>;
   submitPhoto: (dataUrl: string) => Promise<void>;
@@ -53,6 +60,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
   const [connected, setConnected] = useState(false);
   const [state, setState] = useState<RoomState | null>(null);
   const [identity, setIdentity] = useState<Identity | null>(null);
+  const [seatLost, setSeatLost] = useState(false);
   const identityRef = useRef<Identity | null>(null);
 
   useEffect(() => {
@@ -74,7 +82,23 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       // Re-establish room membership after a reconnect.
       const id = identityRef.current;
       if (id) {
-        socket.emit("room:rejoin", { code: id.code, playerId: id.playerId }, () => {});
+        setSeatLost(false);
+        socket.emit(
+          "room:rejoin",
+          { code: id.code, playerId: id.playerId },
+          (res: AckResult<{ ok: true }>) => {
+            if (!res.ok) {
+              // The server no longer has our seat (game ended, or the server
+              // restarted and lost in-memory state). Drop the dead active seat
+              // and surface a clear state rather than a frozen spinner.
+              identityRef.current = null;
+              setIdentity(null);
+              clearIdentity();
+              setState(null);
+              setSeatLost(true);
+            }
+          }
+        );
       }
     };
     const onDisconnect = () => setConnected(false);
@@ -98,6 +122,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     identityRef.current = id;
     setIdentity(id);
     if (id) {
+      setSeatLost(false);
       saveIdentity(id);
     } else {
       clearIdentity();
@@ -184,7 +209,43 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     [persist]
   );
 
+  const rejoinRecent = useCallback(
+    (code: string) =>
+      new Promise<void>((resolve, reject) => {
+        const seat = loadRecentSeat(code);
+        if (!seat) {
+          reject(new Error("No saved seat in this room."));
+          return;
+        }
+        getSocket().emit(
+          "room:rejoin",
+          { code: seat.code, playerId: seat.playerId },
+          (res: AckResult<{ ok: true }>) => {
+            if (res.ok) {
+              persist({
+                code: seat.code,
+                playerId: seat.playerId,
+                isHost: seat.isHost,
+                name: seat.name,
+              });
+              resolve();
+            } else {
+              // The seat is gone — forget it so we stop offering to rejoin it.
+              clearRecentSeat(code);
+              reject(new Error(res.error));
+            }
+          }
+        );
+      }),
+    [persist]
+  );
+
   const leave = useCallback(() => {
+    const current = identityRef.current;
+    if (current) {
+      clearRecentSeat(current.code);
+    }
+    setSeatLost(false);
     persist(null);
     setState(null);
   }, [persist]);
@@ -301,6 +362,8 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     joinRoom,
     checkName,
     rejoin,
+    rejoinRecent,
+    seatLost,
     leave,
     startSubmission: () => simpleAction("host:startSubmission"),
     submitPhoto,
