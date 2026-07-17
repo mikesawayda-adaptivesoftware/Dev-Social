@@ -183,6 +183,12 @@ export const DEFAULT_SETTINGS: GameSettings = {
 export const GEO_DURATION_OPTIONS_SEC = [60, 90, 120] as const;
 export const GEO_DEFAULT_DURATION_SEC = 90;
 
+/**
+ * Hard cap on players in one room. A real decision now — it used to be an
+ * accident of how many colors were in the avatar palette.
+ */
+export const MAX_PLAYERS_PER_ROOM = 100;
+
 // A player's PIN "claims" their name for the season leaderboard. 4-6 digits.
 export const PIN_MIN_LENGTH = 4;
 export const PIN_MAX_LENGTH = 6;
@@ -242,9 +248,33 @@ export interface ClientToServerEvents {
 }
 
 // Server -> Client events
+//
+// `room:state` is the full snapshot. The deltas below exist because the roster
+// is ~99% of a snapshot's bytes and grows with player count, while what actually
+// changed is usually a single field. Re-sending everything on every guess costs
+// roster x players bytes per broadcast, which is fine at 10 players and ~680 MB
+// per game at 100. So the two high-frequency paths — someone joining, someone
+// guessing — send only their diff.
+//
+// Correctness without a sequence/ack protocol: socket.io delivers in order on a
+// connection, and any disconnect ends in a `room:rejoin` that re-sends a full
+// snapshot. So a client can't silently miss a delta and drift. Every phase
+// change also re-snapshots, which bounds staleness to the current round.
 export interface ServerToClientEvents {
+  // Full snapshot. Sent on join/rejoin, on any phase change, and to whoever just
+  // acted (cheap for one player, and it keeps personal fields exact).
   "room:state": (state: RoomState) => void;
   "room:closed": (reason: string) => void;
+  // A player joined the lobby. Appended to the roster client-side.
+  "room:playerJoined": (payload: { player: PublicPlayer }) => void;
+  // A player dropped or came back.
+  "room:playerConnection": (payload: {
+    playerId: string;
+    connected: boolean;
+  }) => void;
+  // Someone guessed. This is the entire news: a counter. Goes to everyone except
+  // the guesser, who gets a snapshot instead.
+  "round:progress": (payload: { answeredCount: number }) => void;
   // Pushed to subscribers of the public games browser whenever the list changes.
   "rooms:list": (rooms: PublicRoomSummary[]) => void;
 }

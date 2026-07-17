@@ -3,6 +3,7 @@ import {
   DEFAULT_GAME_TYPE,
   DEFAULT_SETTINGS,
   GEO_DEFAULT_DURATION_SEC,
+  MAX_PLAYERS_PER_ROOM,
   isGameEnabled,
   type GameSettings,
   type GamePhase,
@@ -31,6 +32,28 @@ const PLAYER_COLORS = [
   "#34d399", // emerald
   "#e879f9", // fuchsia
 ];
+
+/**
+ * A player's avatar color, by join order.
+ *
+ * The first ten keep the hand-picked palette, so a normal-sized game looks
+ * exactly as it always has. Past that we walk the hue circle by the golden angle
+ * (137.5°), which spreads each new hue into the largest remaining gap.
+ *
+ * Note this only guarantees *distinct* colors, not distinguishable ones — at
+ * these counts no palette could. Beyond ~10 players the name is the identity and
+ * color is decoration; don't build anything that relies on telling player 60
+ * from player 79 by hue alone.
+ */
+function playerColor(index: number): string {
+  if (index < PLAYER_COLORS.length) {
+    return PLAYER_COLORS[index];
+  }
+  // Offset past the curated block so generated hues don't restart on top of it.
+  const hue = ((index - PLAYER_COLORS.length + 1) * 137.508) % 360;
+  // Light + saturated: avatars render dark text on this background.
+  return `hsl(${hue.toFixed(1)} 70% 65%)`;
+}
 
 interface InternalPlayer {
   id: string;
@@ -207,7 +230,7 @@ export class RoomStore {
       if (room.visibility !== "public" || room.phase !== "lobby") {
         continue;
       }
-      if (room.players.size >= PLAYER_COLORS.length) {
+      if (room.players.size >= MAX_PLAYERS_PER_ROOM) {
         continue;
       }
       if (![...room.players.values()].some((p) => p.connected)) {
@@ -218,7 +241,7 @@ export class RoomStore {
         hostName: room.players.get(room.hostId)?.name ?? "Host",
         gameType: room.gameType,
         playerCount: room.players.size,
-        maxPlayers: PLAYER_COLORS.length,
+        maxPlayers: MAX_PLAYERS_PER_ROOM,
         createdAt: room.createdAt,
       });
     }
@@ -277,7 +300,7 @@ export class RoomStore {
     room.players.set(playerId, {
       id: playerId,
       name: cleanName(name) || "Host",
-      color: PLAYER_COLORS[0],
+      color: playerColor(0),
       score: 0,
       isHost: true,
       connected: true,
@@ -295,7 +318,7 @@ export class RoomStore {
     if (room.phase !== "lobby") {
       throw new RoomError("This game has already started.");
     }
-    if (room.players.size >= PLAYER_COLORS.length) {
+    if (room.players.size >= MAX_PLAYERS_PER_ROOM) {
       throw new RoomError("This room is full.");
     }
     validatePin(pin);
@@ -304,7 +327,9 @@ export class RoomStore {
       throw new RoomError(claim.reason);
     }
     const playerId = nanoid(10);
-    const color = PLAYER_COLORS[room.players.size % PLAYER_COLORS.length];
+    // Join order indexes the color. Safe because players are never removed from
+    // a room — if a leave/kick is ever added, this needs a real allocator.
+    const color = playerColor(room.players.size);
     room.players.set(playerId, {
       id: playerId,
       name: cleanName(name) || "Player",
@@ -343,14 +368,16 @@ export class RoomStore {
     }
   }
 
-  markDisconnected(socketId: string): string[] {
-    const changed: string[] = [];
+  /** Returns which player in which room went offline, so the socket layer can
+   * send a targeted delta instead of re-broadcasting the whole room. */
+  markDisconnected(socketId: string): { code: string; playerId: string }[] {
+    const changed: { code: string; playerId: string }[] = [];
     for (const room of this.rooms.values()) {
       for (const player of room.players.values()) {
         if (player.socketId === socketId) {
           player.connected = false;
           player.socketId = undefined;
-          changed.push(room.code);
+          changed.push({ code: room.code, playerId: player.id });
         }
       }
     }
@@ -878,6 +905,45 @@ export class RoomStore {
   private touch(room: Room) {
     // Hook for future persistence; for now it just keeps the idle clock honest.
     room.lastActivityAt = Date.now();
+  }
+
+  /**
+   * The client-facing view of a single player, for the `room:playerJoined`
+   * delta. Same shape `viewFor` puts in `players[]`, without building the other
+   * 99 entries to send one.
+   */
+  publicPlayer(code: string, playerId: string): PublicPlayer | null {
+    const room = this.getRoom(code);
+    const player = room?.players.get(playerId);
+    if (!room || !player) {
+      return null;
+    }
+    return {
+      id: player.id,
+      name: player.name,
+      color: player.color,
+      score: player.score,
+      isHost: player.isHost,
+      connected: player.connected,
+      photoCount: room.photos.filter((p) => p.ownerId === player.id).length,
+      spectator: this.isSpectator(room, player.id),
+    };
+  }
+
+  /**
+   * How many guesses are in for the current round — the only thing a guess
+   * changes for everyone other than the guesser. Returns null outside a round.
+   */
+  answeredCount(code: string): number | null {
+    const room = this.getRoom(code);
+    if (!room || room.phase !== "playing") {
+      return null;
+    }
+    const round =
+      room.gameType === "geo_guessr"
+        ? room.geoRounds[room.currentRound]
+        : room.rounds[room.currentRound];
+    return round ? round.guesses.size : null;
   }
 
   /** Build the client-facing, role-aware view of a room for one player. */

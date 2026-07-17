@@ -21,6 +21,7 @@ import {
 import type {
   AckResult,
   GameType,
+  PublicPlayer,
   RoomState,
   RoomVisibility,
 } from "@/shared/types";
@@ -65,6 +66,62 @@ interface GameContextValue {
 }
 
 const GameContext = createContext<GameContextValue | null>(null);
+
+// --- Delta appliers -------------------------------------------------------
+//
+// The server sends a full RoomState snapshot on join/rejoin and on every phase
+// change, but only diffs for the two things that happen at player-count scale:
+// someone joining, and someone guessing. These fold a diff into the state we
+// already hold, so every component downstream keeps reading a plain RoomState
+// and none of them had to learn about the wire format.
+//
+// All three are no-ops when we have no state yet — a delta can arrive before the
+// first snapshot has been applied, and dropping it is correct: the snapshot on
+// its way already includes whatever it was telling us.
+
+function applyPlayerJoined(state: RoomState | null, player: PublicPlayer): RoomState | null {
+  if (!state) {
+    return state;
+  }
+  // Idempotent: a snapshot racing this delta must not double-add the player.
+  if (state.players.some((p) => p.id === player.id)) {
+    return state;
+  }
+  return { ...state, players: [...state.players, player] };
+}
+
+function applyPlayerConnection(
+  state: RoomState | null,
+  playerId: string,
+  connected: boolean
+): RoomState | null {
+  if (!state) {
+    return state;
+  }
+  return {
+    ...state,
+    players: state.players.map((p) =>
+      p.id === playerId ? { ...p, connected } : p
+    ),
+  };
+}
+
+function applyRoundProgress(
+  state: RoomState | null,
+  answeredCount: number
+): RoomState | null {
+  if (!state) {
+    return state;
+  }
+  // Whichever round view is live — the two game types carry the same counter.
+  if (state.geoRound) {
+    return { ...state, geoRound: { ...state.geoRound, answeredCount } };
+  }
+  if (state.round) {
+    return { ...state, round: { ...state.round, answeredCount } };
+  }
+  return state;
+}
 
 export function GameProvider({ children }: { children: React.ReactNode }) {
   const [connected, setConnected] = useState(false);
@@ -113,10 +170,24 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     };
     const onDisconnect = () => setConnected(false);
     const onState = (next: RoomState) => setState(next);
+    const onPlayerJoined = ({ player }: { player: PublicPlayer }) =>
+      setState((s) => applyPlayerJoined(s, player));
+    const onPlayerConnection = ({
+      playerId,
+      connected: isConnected,
+    }: {
+      playerId: string;
+      connected: boolean;
+    }) => setState((s) => applyPlayerConnection(s, playerId, isConnected));
+    const onRoundProgress = ({ answeredCount }: { answeredCount: number }) =>
+      setState((s) => applyRoundProgress(s, answeredCount));
 
     socket.on("connect", onConnect);
     socket.on("disconnect", onDisconnect);
     socket.on("room:state", onState);
+    socket.on("room:playerJoined", onPlayerJoined);
+    socket.on("room:playerConnection", onPlayerConnection);
+    socket.on("round:progress", onRoundProgress);
     if (socket.connected) {
       onConnect();
     }
@@ -125,6 +196,9 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       socket.off("connect", onConnect);
       socket.off("disconnect", onDisconnect);
       socket.off("room:state", onState);
+      socket.off("room:playerJoined", onPlayerJoined);
+      socket.off("room:playerConnection", onPlayerConnection);
+      socket.off("round:progress", onRoundProgress);
     };
   }, []);
 

@@ -1,6 +1,6 @@
 import "./loadEnv";
 import { createServer } from "node:http";
-import { Server } from "socket.io";
+import { Server, type Socket } from "socket.io";
 import { nanoid } from "nanoid";
 import { RoomStore, RoomError } from "./rooms";
 import {
@@ -22,6 +22,13 @@ interface SocketData {
   code?: string;
   playerId?: string;
 }
+
+type GameSocket = Socket<
+  ClientToServerEvents,
+  ServerToClientEvents,
+  Record<string, never>,
+  SocketData
+>;
 
 const store = new RoomStore();
 const httpServer = createServer((req, res) => {
@@ -59,6 +66,43 @@ function broadcastPublicRooms() {
   io.to(BROWSE_ROOM).emit("rooms:list", store.listPublicRooms());
 }
 
+/** Send one player their full personalized snapshot. */
+function sendSnapshot(code: string, playerId: string, socketId: string) {
+  try {
+    io.to(socketId).emit("room:state", store.viewFor(code, playerId));
+  } catch {
+    // Room may have been removed; ignore.
+  }
+}
+
+/**
+ * A guess happened and the round is still open.
+ *
+ * The only thing that changed for everyone else is the answered counter, so send
+ * them 20 bytes instead of a fresh roster each. The guesser gets a real snapshot
+ * — it's one player, and it keeps their personal fields (myGuess/iGuessed) exact
+ * without inventing a second delta shape for them.
+ *
+ * Callers must handle the round-closing case themselves: that's a phase change,
+ * and everyone needs a full snapshot for it.
+ */
+function broadcastGuessProgress(
+  code: string,
+  guesserId: string,
+  socket: GameSocket
+) {
+  const answeredCount = store.answeredCount(code);
+  if (answeredCount === null) {
+    // Not in a round any more — fall back to the safe thing.
+    broadcastRoom(code);
+    return;
+  }
+  // socket.to(room) reaches every member EXCEPT this socket, which is exactly
+  // the split we want, and socket.io encodes the packet once for all of them.
+  socket.to(code).emit("round:progress", { answeredCount });
+  sendSnapshot(code, guesserId, socket.id);
+}
+
 /** Push the personalized room view to every connected member of a room. */
 function broadcastRoom(code: string) {
   const room = store.getRoom(code);
@@ -68,12 +112,7 @@ function broadcastRoom(code: string) {
   if (room) {
     for (const player of room.players.values()) {
       if (player.connected && player.socketId) {
-        try {
-          const view = store.viewFor(code, player.id);
-          io.to(player.socketId).emit("room:state", view);
-        } catch {
-          // Room may have been removed mid-iteration; ignore.
-        }
+        sendSnapshot(code, player.id, player.socketId);
       }
     }
   }
@@ -131,7 +170,16 @@ io.on("connection", (socket) => {
       store.attachSocket(res.code, res.playerId, socket.id);
       socket.join(res.code);
       ack(ok(res));
-      broadcastRoom(res.code);
+
+      // The joiner needs everything; everyone else needs one new roster entry.
+      // Snapshotting all of them here is what made filling a 100-player lobby
+      // cost ~136 MB.
+      sendSnapshot(res.code, res.playerId, socket.id);
+      const player = store.publicPlayer(res.code, res.playerId);
+      if (player) {
+        socket.to(res.code).emit("room:playerJoined", { player });
+      }
+      broadcastPublicRooms();
     } catch (err) {
       ack(fail(err) as never);
     }
@@ -164,11 +212,45 @@ io.on("connection", (socket) => {
       socket.data.playerId = playerId;
       socket.join(code);
       ack(ok({ ok: true as const }));
-      broadcastRoom(code);
+
+      // A full snapshot here is what makes the delta scheme safe: any client
+      // that dropped — and so may have missed deltas — resyncs on the way back.
+      sendSnapshot(code, playerId, socket.id);
+      socket.to(code).emit("room:playerConnection", { playerId, connected: true });
+      broadcastPublicRooms();
     } catch (err) {
       ack(fail(err) as never);
     }
   });
+
+  /**
+   * A guess: the hot path. If it closed the round that's a phase change and
+   * everyone gets a snapshot; otherwise only the counter moved, so everyone but
+   * the guesser gets 20 bytes.
+   */
+  const withGuess = (
+    handler: (code: string, playerId: string) => void,
+    ack?: (res: AckResult<{ ok: true }>) => void
+  ) => {
+    const { code, playerId } = socket.data;
+    if (!code || !playerId) {
+      ack?.({ ok: false, error: "You are not in a room." });
+      return;
+    }
+    try {
+      const phaseBefore = store.getRoom(code)?.phase;
+      handler(code, playerId);
+      ack?.(ok({ ok: true as const }));
+      const phaseAfter = store.getRoom(code)?.phase;
+      if (phaseAfter !== phaseBefore) {
+        broadcastRoom(code);
+      } else {
+        broadcastGuessProgress(code, playerId, socket);
+      }
+    } catch (err) {
+      ack?.(fail(err) as never);
+    }
+  };
 
   const withRoom = (
     handler: (code: string, playerId: string) => void,
@@ -223,7 +305,7 @@ io.on("connection", (socket) => {
     withRoom((code, pid) => store.startGame(code, pid), ack)
   );
   socket.on("guess:submit", ({ choiceId }, ack) =>
-    withRoom((code, pid) => store.submitGuess(code, pid, choiceId), ack)
+    withGuess((code, pid) => store.submitGuess(code, pid, choiceId), ack)
   );
   socket.on("host:startGeoGame", async ({ roundDurationSec, hostPlaying }, ack) => {
     const { code, playerId } = socket.data;
@@ -240,7 +322,7 @@ io.on("connection", (socket) => {
     }
   });
   socket.on("geo:guess", ({ lat, lng }, ack) =>
-    withRoom((code, pid) => store.submitGeoGuess(code, pid, lat, lng), ack)
+    withGuess((code, pid) => store.submitGeoGuess(code, pid, lat, lng), ack)
   );
   socket.on("host:nextRound", (ack) =>
     withRoom((code, pid) => store.nextRound(code, pid), ack)
@@ -251,11 +333,24 @@ io.on("connection", (socket) => {
 
   socket.on("disconnect", () => {
     const changed = store.markDisconnected(socket.id);
-    for (const code of changed) {
+    for (const { code, playerId } of changed) {
+      const phaseBefore = store.getRoom(code)?.phase;
       // A dropout may let the current round close early, or (if the host left)
       // arm the reveal auto-advance, before we push the updated state.
       store.handleDisconnect(code);
-      broadcastRoom(code);
+      const room = store.getRoom(code);
+      if (!room) {
+        continue;
+      }
+      if (room.phase !== phaseBefore) {
+        // The dropout closed the round — that's a phase change, everyone needs
+        // the new state.
+        broadcastRoom(code);
+      } else {
+        // This socket has already left its rooms, so io.to reaches the rest.
+        io.to(code).emit("room:playerConnection", { playerId, connected: false });
+        broadcastPublicRooms();
+      }
     }
   });
 });
