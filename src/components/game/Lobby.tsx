@@ -4,26 +4,15 @@ import { useState, useSyncExternalStore } from "react";
 import { useGame } from "@/components/GameProvider";
 import { Button } from "@/components/ui";
 import {
+  ENABLED_GAME_TYPES,
+  GAME_TYPE_BLURB,
+  GAME_TYPE_EMOJI,
+  GAME_TYPE_LABELS,
   GEO_DEFAULT_DURATION_SEC,
   GEO_DURATION_OPTIONS_SEC,
   type GameType,
 } from "@/shared/types";
 import { PlayerList, RoomCodeBadge } from "./shared";
-
-const GAMES: { type: GameType; emoji: string; name: string; blurb: string }[] = [
-  {
-    type: "photo_guessr",
-    emoji: "📸",
-    name: "Photo Guessr",
-    blurb: "Match everyone's photos to the right teammate.",
-  },
-  {
-    type: "geo_guessr",
-    emoji: "🗺️",
-    name: "Real GeoGuessr",
-    blurb: "Explore Street View and pin the location on a map.",
-  },
-];
 
 // `window.location.origin` is client-only. Read it via useSyncExternalStore so
 // SSR renders "" (getServerSnapshot) and the client the real origin, with no
@@ -33,11 +22,11 @@ const getOrigin = () => window.location.origin;
 const getServerOrigin = () => "";
 
 export function Lobby() {
-  const { state, isHost, me, startSubmission, startGeoGame } = useGame();
+  const { state, isHost, me, setGameType, startSubmission, startGeoGame } =
+    useGame();
   const origin = useSyncExternalStore(subscribeNoop, getOrigin, getServerOrigin);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [selected, setSelected] = useState<GameType>("photo_guessr");
   const [geoDuration, setGeoDuration] = useState<number>(
     GEO_DEFAULT_DURATION_SEC
   );
@@ -50,7 +39,18 @@ export function Lobby() {
 
   const joinUrl = origin ? `${origin}/join?code=${state.code}` : "";
 
+  // The host's pick lives on the server, so everyone in the lobby (and the
+  // public games list) sees the same selection.
+  const selected = state.gameType;
+
   const notEnough = state.players.length < 2;
+
+  function pickGame(gameType: GameType) {
+    setError(null);
+    setGameType(gameType).catch((e) =>
+      setError(e instanceof Error ? e.message : "Couldn't switch the game.")
+    );
+  }
 
   async function copyLink() {
     if (!joinUrl) return;
@@ -119,6 +119,11 @@ export function Lobby() {
             {copied ? "✓ Copied" : "Copy"}
           </span>
         </button>
+        {state.visibility === "public" && (
+          <p className="text-xs text-emerald-300/80">
+            🌐 Listed in Live games — anyone can join until you start.
+          </p>
+        )}
       </div>
 
       <div className="card mt-8 p-6">
@@ -130,20 +135,26 @@ export function Lobby() {
 
       {isHost ? (
         <div className="mt-8 space-y-4">
-          <div className="grid gap-3 sm:grid-cols-2">
-            {GAMES.map((g) => (
+          {/* Two-up only when there's more than one game to choose between —
+              a lone half-width card reads as a layout bug. */}
+          <div
+            className={`grid gap-3 ${
+              ENABLED_GAME_TYPES.length > 1 ? "sm:grid-cols-2" : ""
+            }`}
+          >
+            {ENABLED_GAME_TYPES.map((type) => (
               <button
-                key={g.type}
-                onClick={() => setSelected(g.type)}
+                key={type}
+                onClick={() => pickGame(type)}
                 className={`rounded-2xl border-2 p-4 text-left transition-all ${
-                  selected === g.type
+                  selected === type
                     ? "border-fuchsia-400 bg-fuchsia-400/15"
                     : "border-white/10 bg-white/5 hover:border-white/30"
                 }`}
               >
-                <div className="text-2xl">{g.emoji}</div>
-                <div className="mt-1 font-bold">{g.name}</div>
-                <div className="text-xs text-white/50">{g.blurb}</div>
+                <div className="text-2xl">{GAME_TYPE_EMOJI[type]}</div>
+                <div className="mt-1 font-bold">{GAME_TYPE_LABELS[type]}</div>
+                <div className="text-xs text-white/50">{GAME_TYPE_BLURB[type]}</div>
               </button>
             ))}
           </div>
@@ -209,9 +220,17 @@ export function Lobby() {
           </p>
         </div>
       ) : (
-        <p className="mt-8 text-lg text-white/70">
-          You&apos;re in! Waiting for the host to start…
-        </p>
+        <div className="mt-8">
+          <p className="text-lg text-white/70">
+            You&apos;re in! Waiting for the host to start…
+          </p>
+          <p className="mt-3 text-sm text-white/50">
+            Up next: {GAME_TYPE_EMOJI[selected]}{" "}
+            <span className="font-semibold text-white/80">
+              {GAME_TYPE_LABELS[selected]}
+            </span>
+          </p>
+        </div>
       )}
     </div>
   );

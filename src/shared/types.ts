@@ -10,12 +10,46 @@ export type GamePhase =
 
 export type GameType = "photo_guessr" | "geo_guessr";
 
+// Whether a room is discoverable in the public games browser. Private rooms are
+// reachable only by their code / join link, which is the historical behaviour.
+export type RoomVisibility = "public" | "private";
+
 // Human-friendly names for each game type, used in the UI (leaderboard tabs,
 // game badges, etc.).
 export const GAME_TYPE_LABELS: Record<GameType, string> = {
   photo_guessr: "Photo Guessr",
   geo_guessr: "Real GeoGuessr",
 };
+
+export const GAME_TYPE_EMOJI: Record<GameType, string> = {
+  photo_guessr: "📸",
+  geo_guessr: "🗺️",
+};
+
+export const GAME_TYPE_BLURB: Record<GameType, string> = {
+  photo_guessr: "Match everyone's photos to the right teammate.",
+  geo_guessr: "Explore Street View and pin the location on a map.",
+};
+
+/**
+ * Games that can currently be played. This is the single switch for taking a
+ * game out of rotation: it drives the lobby picker, the default game for new
+ * rooms, and server-side rejection — so a disabled game can't be started by a
+ * stale client or a hand-crafted socket payload either.
+ *
+ * The labels/emoji/blurbs above deliberately stay complete for every GameType,
+ * so finished games of a disabled type still render on the leaderboard.
+ *
+ * To re-enable Photo Guessr, put "photo_guessr" back in this list.
+ */
+export const ENABLED_GAME_TYPES = ["geo_guessr"] as const satisfies readonly GameType[];
+
+/** What a fresh lobby opens on. Must be an enabled game. */
+export const DEFAULT_GAME_TYPE: GameType = ENABLED_GAME_TYPES[0];
+
+export function isGameEnabled(gameType: GameType): boolean {
+  return (ENABLED_GAME_TYPES as readonly GameType[]).includes(gameType);
+}
 
 export interface PublicPlayer {
   id: string;
@@ -101,11 +135,27 @@ export interface GeoRevealView {
   results: GeoResult[];
 }
 
+/**
+ * A room as it appears in the public games browser. Deliberately minimal — this
+ * goes to anyone on the site, including people not in the room.
+ */
+export interface PublicRoomSummary {
+  code: string;
+  hostName: string;
+  // What the host currently has selected in the lobby. Live: it follows their
+  // picks (see `host:setGameType`) rather than only becoming true at start.
+  gameType: GameType;
+  playerCount: number;
+  maxPlayers: number;
+  createdAt: number; // epoch ms, for an "opened 3m ago" hint
+}
+
 export interface RoomState {
   code: string;
   phase: GamePhase;
   gameType: GameType;
   hostId: string;
+  visibility: RoomVisibility;
   players: PublicPlayer[];
   settings: GameSettings;
   submission?: SubmissionView;
@@ -141,9 +191,15 @@ export const PIN_PATTERN = /^\d{4,6}$/;
 // Client -> Server events
 export interface ClientToServerEvents {
   "room:create": (
-    payload: { name: string; pin: string },
+    payload: { name: string; pin: string; visibility: RoomVisibility },
     ack: (res: AckResult<{ code: string; playerId: string }>) => void
   ) => void;
+  // Subscribe to live updates of the public games list. Acks with the current
+  // list so a browser doesn't have to wait for the next change to render.
+  "rooms:subscribe": (
+    ack: (res: AckResult<{ rooms: PublicRoomSummary[] }>) => void
+  ) => void;
+  "rooms:unsubscribe": () => void;
   "room:join": (
     payload: { code: string; name: string; pin: string },
     ack: (res: AckResult<{ code: string; playerId: string }>) => void
@@ -155,6 +211,12 @@ export interface ClientToServerEvents {
   "room:rejoin": (
     payload: { code: string; playerId: string },
     ack: (res: AckResult<{ ok: true }>) => void
+  ) => void;
+  // Host-only, lobby-only. The host's game choice is server state, not local UI
+  // state, so the lobby and the public games list both reflect it live.
+  "host:setGameType": (
+    payload: { gameType: GameType },
+    ack?: (res: AckResult<{ ok: true }>) => void
   ) => void;
   "host:startSubmission": (ack?: (res: AckResult<{ ok: true }>) => void) => void;
   "photo:submit": (
@@ -183,6 +245,8 @@ export interface ClientToServerEvents {
 export interface ServerToClientEvents {
   "room:state": (state: RoomState) => void;
   "room:closed": (reason: string) => void;
+  // Pushed to subscribers of the public games browser whenever the list changes.
+  "rooms:list": (rooms: PublicRoomSummary[]) => void;
 }
 
 export type AckResult<T> =

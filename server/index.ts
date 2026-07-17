@@ -44,22 +44,43 @@ const io = new Server<
   maxHttpBufferSize: 4_000_000, // allow base64 photo uploads
 });
 
+// Socket.IO room holding everyone watching the public games browser. Unlike a
+// game room, every subscriber gets the identical payload, so this one really is
+// a broadcast (see `broadcastRoom` below for why game rooms can't be).
+const BROWSE_ROOM = "browse:public";
+
+/** Push the current public games list to anyone browsing. */
+function broadcastPublicRooms() {
+  // Nobody's looking — skip rebuilding the list. Without this guard every guess
+  // in every in-progress game would recompute it for no one.
+  if (!io.sockets.adapter.rooms.get(BROWSE_ROOM)?.size) {
+    return;
+  }
+  io.to(BROWSE_ROOM).emit("rooms:list", store.listPublicRooms());
+}
+
 /** Push the personalized room view to every connected member of a room. */
 function broadcastRoom(code: string) {
   const room = store.getRoom(code);
-  if (!room) {
-    return;
-  }
-  for (const player of room.players.values()) {
-    if (player.connected && player.socketId) {
-      try {
-        const view = store.viewFor(code, player.id);
-        io.to(player.socketId).emit("room:state", view);
-      } catch {
-        // Room may have been removed mid-iteration; ignore.
+  // Each player needs a *different* view (answer coords are withheld from
+  // whoever hasn't guessed yet), so this emits per-socket rather than to the
+  // socket.io room.
+  if (room) {
+    for (const player of room.players.values()) {
+      if (player.connected && player.socketId) {
+        try {
+          const view = store.viewFor(code, player.id);
+          io.to(player.socketId).emit("room:state", view);
+        } catch {
+          // Room may have been removed mid-iteration; ignore.
+        }
       }
     }
   }
+  // Any room change can change the browsable list — a player joining bumps a
+  // count, a host starting removes the lobby entirely. Every mutation path funnels
+  // through here, so piggybacking keeps the list from ever going stale.
+  broadcastPublicRooms();
 }
 
 store.onRoomChanged = broadcastRoom;
@@ -88,9 +109,9 @@ function fail(error: unknown): AckResult<never> {
 }
 
 io.on("connection", (socket) => {
-  socket.on("room:create", async ({ name, pin }, ack) => {
+  socket.on("room:create", async ({ name, pin, visibility }, ack) => {
     try {
-      const { code, playerId } = await store.createRoom(name, pin);
+      const { code, playerId } = await store.createRoom(name, pin, visibility);
       socket.data.code = code;
       socket.data.playerId = playerId;
       store.attachSocket(code, playerId, socket.id);
@@ -114,6 +135,17 @@ io.on("connection", (socket) => {
     } catch (err) {
       ack(fail(err) as never);
     }
+  });
+
+  socket.on("rooms:subscribe", (ack) => {
+    socket.join(BROWSE_ROOM);
+    // Ack with the list so the browser paints immediately instead of waiting
+    // for the next room change to push one.
+    ack(ok({ rooms: store.listPublicRooms() }));
+  });
+
+  socket.on("rooms:unsubscribe", () => {
+    socket.leave(BROWSE_ROOM);
   });
 
   socket.on("name:check", async ({ name }, ack) => {
@@ -156,6 +188,9 @@ io.on("connection", (socket) => {
     }
   };
 
+  socket.on("host:setGameType", ({ gameType }, ack) =>
+    withRoom((code, pid) => store.setGameType(code, pid, gameType), ack)
+  );
   socket.on("host:startSubmission", (ack) =>
     withRoom((code, pid) => store.startSubmission(code, pid), ack)
   );
@@ -225,7 +260,12 @@ io.on("connection", (socket) => {
   });
 });
 
-setInterval(() => store.sweep(), 1000 * 60 * 30);
+// Runs often enough that the sweep's short empty-lobby TTL means something —
+// at a 30m interval a "10 minute" reap could take 40.
+setInterval(() => {
+  store.sweep();
+  broadcastPublicRooms();
+}, 1000 * 60 * 2);
 
 httpServer.listen(PORT, () => {
   console.log(`\u25B6 Realtime game server listening on http://localhost:${PORT}`);

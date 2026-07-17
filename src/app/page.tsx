@@ -6,13 +6,19 @@ import { useState } from "react";
 import { useGame } from "@/components/GameProvider";
 import { NameClaimFields } from "@/components/NameClaimFields";
 import { Button } from "@/components/ui";
-import { PIN_PATTERN } from "@/shared/types";
+import {
+  DEFAULT_GAME_TYPE,
+  GAME_TYPE_BLURB,
+  GAME_TYPE_LABELS,
+  PIN_PATTERN,
+} from "@/shared/types";
 
 export default function Home() {
   const router = useRouter();
   const { createRoom, connected } = useGame();
   const [name, setName] = useState("");
   const [pin, setPin] = useState("");
+  const [isPublic, setIsPublic] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -28,7 +34,11 @@ export default function Home() {
     setBusy(true);
     setError(null);
     try {
-      const code = await createRoom(name.trim(), pin);
+      const code = await createRoom(
+        name.trim(),
+        pin,
+        isPublic ? "public" : "private"
+      );
       router.push(`/room/${code}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Couldn't create the room.");
@@ -62,6 +72,22 @@ export default function Home() {
             onEnter={handleHost}
           />
 
+          <label className="flex cursor-pointer items-center gap-3 rounded-xl border border-white/10 bg-white/5 p-3">
+            <input
+              type="checkbox"
+              checked={isPublic}
+              onChange={(e) => setIsPublic(e.target.checked)}
+              className="h-5 w-5 accent-fuchsia-500"
+            />
+            <span className="text-sm">
+              <span className="font-semibold">List this game publicly</span>
+              <span className="block text-xs text-white/40">
+                Anyone can find and join it from Live games until you start. Off =
+                only people with your link can join.
+              </span>
+            </span>
+          </label>
+
           <Button
             onClick={handleHost}
             disabled={busy || !connected}
@@ -75,6 +101,12 @@ export default function Home() {
             OR
             <span className="h-px flex-1 bg-white/10" />
           </div>
+
+          <Link href="/games" className="block">
+            <Button variant="secondary" className="w-full">
+              Browse live games
+            </Button>
+          </Link>
 
           <Link href="/join" className="block">
             <Button variant="secondary" className="w-full">
@@ -100,8 +132,11 @@ export default function Home() {
         </Link>
 
         <p className="mt-4 text-xs text-white/40">
-          First game: <span className="text-white/70">Photo Guessr</span> — match
-          the baby photo to the teammate.
+          Now playing:{" "}
+          <span className="text-white/70">
+            {GAME_TYPE_LABELS[DEFAULT_GAME_TYPE]}
+          </span>{" "}
+          — {GAME_TYPE_BLURB[DEFAULT_GAME_TYPE]}
         </p>
       </div>
     </main>

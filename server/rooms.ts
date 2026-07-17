@@ -1,12 +1,16 @@
 import { nanoid } from "nanoid";
 import {
+  DEFAULT_GAME_TYPE,
   DEFAULT_SETTINGS,
   GEO_DEFAULT_DURATION_SEC,
+  isGameEnabled,
   type GameSettings,
   type GamePhase,
   type GameType,
   type RoomState,
   type PublicPlayer,
+  type PublicRoomSummary,
+  type RoomVisibility,
 } from "../src/shared/types";
 import { GEO_LOCATIONS, resolvePano } from "./geoLocations";
 import {
@@ -90,6 +94,8 @@ interface Room {
   hostId: string;
   phase: GamePhase;
   gameType: GameType;
+  // "public" lists the room in the games browser while it's an open lobby.
+  visibility: RoomVisibility;
   // Whether the host competes. When false the host is a pure spectator (runs the
   // big screen) and is hidden from scoreboards, rankings, and persistence.
   hostPlaying: boolean;
@@ -105,6 +111,9 @@ interface Room {
   // if the host reconnects in time.
   autoAdvanceTimer?: ReturnType<typeof setTimeout>;
   createdAt: number;
+  // Last time anything happened in this room. Drives the sweep, so an idle room
+  // is reaped on how long it's been dead rather than how long ago it was made.
+  lastActivityAt: number;
   persisted: boolean;
 }
 
@@ -182,6 +191,40 @@ export class RoomStore {
     return this.rooms.get(code.toUpperCase());
   }
 
+  /**
+   * Rooms to show in the public games browser: public, still an open lobby, not
+   * full, and with someone actually sitting in them.
+   *
+   * The "someone connected" check matters. A room outlives every player's
+   * connection (see `sweep`), which nobody noticed while rooms were only
+   * reachable by code — you can't stumble onto a room you were never given. A
+   * browser surfaces them, so an abandoned lobby would show up as a joinable
+   * game that nobody is in. Newest first.
+   */
+  listPublicRooms(): PublicRoomSummary[] {
+    const summaries: PublicRoomSummary[] = [];
+    for (const room of this.rooms.values()) {
+      if (room.visibility !== "public" || room.phase !== "lobby") {
+        continue;
+      }
+      if (room.players.size >= PLAYER_COLORS.length) {
+        continue;
+      }
+      if (![...room.players.values()].some((p) => p.connected)) {
+        continue;
+      }
+      summaries.push({
+        code: room.code,
+        hostName: room.players.get(room.hostId)?.name ?? "Host",
+        gameType: room.gameType,
+        playerCount: room.players.size,
+        maxPlayers: PLAYER_COLORS.length,
+        createdAt: room.createdAt,
+      });
+    }
+    return summaries.sort((a, b) => b.createdAt - a.createdAt);
+  }
+
   private requireRoom(code: string): Room {
     const room = this.getRoom(code);
     if (!room) {
@@ -203,7 +246,8 @@ export class RoomStore {
 
   async createRoom(
     name: string,
-    pin: string
+    pin: string,
+    visibility: RoomVisibility = "private"
   ): Promise<{ code: string; playerId: string }> {
     validatePin(pin);
     const claim = await claimOrVerifyName(cleanName(name) || "Host", pin);
@@ -212,11 +256,13 @@ export class RoomStore {
     }
     const code = makeCode(new Set(this.rooms.keys()));
     const playerId = nanoid(10);
+    const now = Date.now();
     const room: Room = {
       code,
       hostId: playerId,
       phase: "lobby",
-      gameType: "photo_guessr",
+      gameType: DEFAULT_GAME_TYPE,
+      visibility: visibility === "public" ? "public" : "private",
       hostPlaying: false,
       settings: { ...DEFAULT_SETTINGS },
       players: new Map(),
@@ -224,7 +270,8 @@ export class RoomStore {
       rounds: [],
       geoRounds: [],
       currentRound: 0,
-      createdAt: Date.now(),
+      createdAt: now,
+      lastActivityAt: now,
       persisted: false,
     };
     room.players.set(playerId, {
@@ -310,12 +357,42 @@ export class RoomStore {
     return changed;
   }
 
-  startSubmission(code: string, playerId: string) {
+  /**
+   * Host-only, lobby-only. Records which game the host has selected.
+   *
+   * This is server state rather than local UI state so that `gameType` is always
+   * true of the room — everyone in the lobby sees the choice, the public games
+   * list can show it, and the start paths below can't inherit a stale value.
+   */
+  setGameType(code: string, playerId: string, gameType: GameType) {
     const room = this.requireRoom(code);
     this.requireHost(room, playerId);
     if (room.phase !== "lobby") {
+      throw new RoomError("You can only change the game from the lobby.");
+    }
+    if (gameType !== "photo_guessr" && gameType !== "geo_guessr") {
+      throw new RoomError("That isn't a game we know.");
+    }
+    if (!isGameEnabled(gameType)) {
+      throw new RoomError("That game isn't available right now.");
+    }
+    room.gameType = gameType;
+    this.touch(room);
+  }
+
+  startSubmission(code: string, playerId: string) {
+    const room = this.requireRoom(code);
+    this.requireHost(room, playerId);
+    if (!isGameEnabled("photo_guessr")) {
+      throw new RoomError("Photo Guessr isn't available right now.");
+    }
+    if (room.phase !== "lobby") {
       throw new RoomError("Submissions can only start from the lobby.");
     }
+    // This is the Photo Guessr path, so say so. Without this the room could
+    // enter submission still carrying "geo_guessr" from an earlier game, and
+    // `viewFor` would take its geo branch and never build a submission view.
+    room.gameType = "photo_guessr";
     room.phase = "submission";
     this.touch(room);
   }
@@ -408,6 +485,9 @@ export class RoomStore {
   ) {
     const room = this.requireRoom(code);
     this.requireHost(room, playerId);
+    if (!isGameEnabled("geo_guessr")) {
+      throw new RoomError("Real GeoGuessr isn't available right now.");
+    }
     if (room.phase !== "lobby") {
       throw new RoomError("You can only start a game from the lobby.");
     }
@@ -748,6 +828,9 @@ export class RoomStore {
     room.currentRound = 0;
     room.persisted = false;
     room.hostPlaying = false;
+    // Back to the default the lobby picker opens on. Leaving the finished game's
+    // type here would desync the room from a host who then picks the other game.
+    room.gameType = DEFAULT_GAME_TYPE;
     for (const p of room.players.values()) {
       p.score = 0;
     }
@@ -793,8 +876,8 @@ export class RoomStore {
   }
 
   private touch(room: Room) {
-    // Hook for future persistence; currently a no-op besides existence.
-    void room;
+    // Hook for future persistence; for now it just keeps the idle clock honest.
+    room.lastActivityAt = Date.now();
   }
 
   /** Build the client-facing, role-aware view of a room for one player. */
@@ -821,6 +904,7 @@ export class RoomStore {
       phase: room.phase,
       gameType: room.gameType,
       hostId: room.hostId,
+      visibility: room.visibility,
       players,
       settings: room.settings,
     };
@@ -935,12 +1019,25 @@ export class RoomStore {
     return state;
   }
 
-  /** Remove rooms older than the TTL with no connected players. */
-  sweep(ttlMs = 1000 * 60 * 60 * 6) {
+  /**
+   * Remove idle rooms nobody is connected to.
+   *
+   * Two TTLs, because the two cases are worth very different grace periods. An
+   * abandoned *lobby* holds nothing — no scores, no rounds — so it goes after
+   * `emptyLobbyTtlMs`; keeping it around just leaks memory and (now) clutters
+   * the games browser. A room that got past the lobby holds a real game, and
+   * everyone dropping at once usually means a shared network blip rather than
+   * everyone quitting, so it keeps the long TTL to protect the rejoin flow.
+   *
+   * Both measure from last activity, not creation: a game still going after the
+   * TTL shouldn't be reaped the moment its players briefly drop.
+   */
+  sweep(ttlMs = 1000 * 60 * 60 * 6, emptyLobbyTtlMs = 1000 * 60 * 10) {
     const now = Date.now();
     for (const [code, room] of this.rooms) {
       const anyConnected = [...room.players.values()].some((p) => p.connected);
-      if (!anyConnected && now - room.createdAt > ttlMs) {
+      const ttl = room.phase === "lobby" ? emptyLobbyTtlMs : ttlMs;
+      if (!anyConnected && now - room.lastActivityAt > ttl) {
         if (room.roundTimer) {
           clearTimeout(room.roundTimer);
         }

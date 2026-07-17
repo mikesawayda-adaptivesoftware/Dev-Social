@@ -18,7 +18,12 @@ import {
   saveIdentity,
   type Identity,
 } from "@/lib/socket";
-import type { AckResult, RoomState } from "@/shared/types";
+import type {
+  AckResult,
+  GameType,
+  RoomState,
+  RoomVisibility,
+} from "@/shared/types";
 
 type NoArgEvent =
   | "host:startSubmission"
@@ -33,7 +38,11 @@ interface GameContextValue {
   identity: Identity | null;
   me: RoomState["players"][number] | null;
   isHost: boolean;
-  createRoom: (name: string, pin: string) => Promise<string>;
+  createRoom: (
+    name: string,
+    pin: string,
+    visibility: RoomVisibility
+  ) => Promise<string>;
   joinRoom: (code: string, name: string, pin: string) => Promise<string>;
   checkName: (name: string) => Promise<boolean>;
   rejoin: (code: string) => Promise<void>;
@@ -43,6 +52,7 @@ interface GameContextValue {
   // "this game is no longer available" state instead of an endless spinner.
   seatLost: boolean;
   leave: () => void;
+  setGameType: (gameType: GameType) => Promise<void>;
   startSubmission: () => Promise<void>;
   submitPhoto: (dataUrl: string) => Promise<void>;
   clearMyPhotos: () => Promise<void>;
@@ -130,11 +140,11 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const createRoom = useCallback(
-    (name: string, pin: string) =>
+    (name: string, pin: string, visibility: RoomVisibility) =>
       new Promise<string>((resolve, reject) => {
         getSocket().emit(
           "room:create",
-          { name, pin },
+          { name, pin, visibility },
           (res: AckResult<{ code: string; playerId: string }>) => {
             if (res.ok) {
               persist({ code: res.code, playerId: res.playerId, isHost: true, name });
@@ -291,6 +301,24 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     []
   );
 
+  const setGameType = useCallback(
+    (gameType: GameType) =>
+      new Promise<void>((resolve, reject) => {
+        getSocket().emit(
+          "host:setGameType",
+          { gameType },
+          (res: AckResult<{ ok: true }>) => {
+            if (res?.ok) {
+              resolve();
+            } else {
+              reject(new Error(res?.error ?? "Couldn't switch the game."));
+            }
+          }
+        );
+      }),
+    []
+  );
+
   const submitGuess = useCallback(
     (choiceId: string) =>
       new Promise<void>((resolve, reject) => {
@@ -365,6 +393,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     rejoinRecent,
     seatLost,
     leave,
+    setGameType,
     startSubmission: () => simpleAction("host:startSubmission"),
     submitPhoto,
     clearMyPhotos: () => simpleAction("photo:clearMine"),
