@@ -18,6 +18,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "overall", label: "Overall" },
   { id: "photo_guessr", label: GAME_TYPE_LABELS.photo_guessr },
   { id: "geo_guessr", label: GAME_TYPE_LABELS.geo_guessr },
+  { id: "word_chain", label: GAME_TYPE_LABELS.word_chain },
 ];
 
 function gameTypeLabel(type: string): string {

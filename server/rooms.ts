@@ -4,7 +4,9 @@ import {
   DEFAULT_SETTINGS,
   GEO_DEFAULT_DURATION_SEC,
   MAX_PLAYERS_PER_ROOM,
+  WORD_CHAIN_DEFAULT_DURATION_SEC,
   isGameEnabled,
+  isKnownGameType,
   type GameSettings,
   type GamePhase,
   type GameType,
@@ -12,11 +14,15 @@ import {
   type PublicPlayer,
   type PublicRoomSummary,
   type RoomVisibility,
+  type WordChainGuessResult,
+  type WordChainStanding,
 } from "../src/shared/types";
 import { GEO_LOCATIONS, resolvePano } from "./geoLocations";
+import { WORD_CHAINS, freeLetters, normalizeWord } from "./wordChains";
 import {
   claimOrVerifyName,
   getSeenCounts,
+  getSeenPuzzleCounts,
   type FinishedGame,
 } from "./supabase";
 
@@ -112,6 +118,31 @@ interface GeoRound {
   closed: boolean;
 }
 
+/** One player's run at the current chain. Blanks are solved top down, so
+ * `solved` doubles as the index of the blank they're on. */
+interface WordChainProgress {
+  solved: number;
+  /** Extra letters bought per blank, index-aligned with the chain's blanks. */
+  hints: number[];
+  hintsUsed: number;
+  wrongGuesses: number;
+  /** ms from round start to completing the chain; unset while still solving. */
+  finishedMs?: number;
+}
+
+interface WordChainRound {
+  id: string;
+  puzzleId: string;
+  /** The whole chain. `words[0]` and the last word are given; the rest are the
+   * blanks, so a six-word chain is four blanks. Never sent to clients wholesale
+   * until the reveal. */
+  words: string[];
+  progress: Map<string, WordChainProgress>;
+  startedAt: number;
+  durationMs: number;
+  closed: boolean;
+}
+
 interface Room {
   code: string;
   hostId: string;
@@ -127,6 +158,10 @@ interface Room {
   photos: InternalPhoto[];
   rounds: InternalRound[];
   geoRounds: GeoRound[];
+  // Word Chain is one puzzle per game, but it rides the same
+  // beginRound/closeRound/advanceRound machinery as the others, so it's a
+  // (currently single-element) list rather than a special case.
+  wordRounds: WordChainRound[];
   currentRound: number;
   roundTimer?: ReturnType<typeof setTimeout>;
   // When the host is disconnected during a reveal, this timer advances the game
@@ -147,6 +182,20 @@ const HOST_ABSENT_REVEAL_MS = 15_000;
 const MAX_GEO_POINTS = 5000;
 // Distance (km) scale for the exponential score decay. Larger = more forgiving.
 const GEO_SCORE_SCALE_KM = 1500;
+
+// Word Chain scoring. Every puzzle in the bank is four blanks, so a clean
+// instant sweep tops out at 4x500 + 1000 + 2000 = 5000 — the same ceiling as a
+// perfect GeoGuessr round, which keeps the two games' scores on one scale.
+//
+// The shape matters more than the numbers: partial credit per link means a
+// player who runs out of time still scores, while the completion and speed
+// bonuses are what make it a race rather than a crossword.
+const WORD_CHAIN_LINK_POINTS = 500;
+const WORD_CHAIN_FINISH_BONUS = 1000;
+const WORD_CHAIN_SPEED_BONUS_MAX = 2000;
+// A hint costs less than a link is worth, so buying one is never worse than
+// giving up on the word — but four of them eat most of a link.
+const WORD_CHAIN_HINT_PENALTY = 100;
 
 /** Great-circle distance between two lat/lng points, in kilometers. */
 function haversineKm(
@@ -267,6 +316,17 @@ export class RoomStore {
     return playerId === room.hostId && !room.hostPlaying;
   }
 
+  /**
+   * Names of everyone who'd be competing under a given host-playing choice.
+   * Takes `hostPlaying` explicitly because the start paths need this *before*
+   * committing the choice to the room.
+   */
+  private competitorNames(room: Room, hostPlaying: boolean): string[] {
+    return [...room.players.values()]
+      .filter((p) => hostPlaying || p.id !== room.hostId)
+      .map((p) => p.name);
+  }
+
   async createRoom(
     name: string,
     pin: string,
@@ -292,6 +352,7 @@ export class RoomStore {
       photos: [],
       rounds: [],
       geoRounds: [],
+      wordRounds: [],
       currentRound: 0,
       createdAt: now,
       lastActivityAt: now,
@@ -397,7 +458,7 @@ export class RoomStore {
     if (room.phase !== "lobby") {
       throw new RoomError("You can only change the game from the lobby.");
     }
-    if (gameType !== "photo_guessr" && gameType !== "geo_guessr") {
+    if (!isKnownGameType(gameType)) {
       throw new RoomError("That isn't a game we know.");
     }
     if (!isGameEnabled(gameType)) {
@@ -538,9 +599,10 @@ export class RoomStore {
     // shuffle first (random tie-break), then stable-sort by how many of them
     // have already seen each spot. This never blocks: once everyone has seen
     // everything, it simply falls back to the least-seen locations.
-    const competitorNames = [...room.players.values()]
-      .filter((p) => !this.isSpectator(room, p.id))
-      .map((p) => p.name);
+    // Read `hostPlaying` from the argument, not from the room: it isn't
+    // committed until the game actually starts, so `isSpectator` would still be
+    // answering for the last game and drop a playing host from the history.
+    const competitorNames = this.competitorNames(room, hostPlaying);
     const seenCounts = await getSeenCounts(competitorNames);
     const pool = shuffle(GEO_LOCATIONS).sort(
       (a, b) => (seenCounts.get(a.id) ?? 0) - (seenCounts.get(b.id) ?? 0)
@@ -579,6 +641,7 @@ export class RoomStore {
     room.settings.roundDurationSec = duration;
     room.geoRounds = rounds;
     room.rounds = [];
+    room.wordRounds = [];
     room.photos = [];
     room.currentRound = 0;
     for (const p of room.players.values()) {
@@ -632,6 +695,221 @@ export class RoomStore {
   }
 
   /**
+   * Host-only. Start a Word Chain race from the lobby.
+   *
+   * One seeded puzzle, one clock, everybody solving the same chain at once.
+   * Unlike the other games this one is playable solo — a lone host racing the
+   * timer is a perfectly good version of it — so the only floor is that
+   * somebody is actually competing.
+   *
+   * Async because puzzle choice consults each competitor's history.
+   */
+  async startWordChainGame(
+    code: string,
+    playerId: string,
+    durationSec: number,
+    hostPlaying: boolean
+  ) {
+    const room = this.requireRoom(code);
+    this.requireHost(room, playerId);
+    if (!isGameEnabled("word_chain")) {
+      throw new RoomError("Word Chain isn't available right now.");
+    }
+    if (room.phase !== "lobby") {
+      throw new RoomError("You can only start a game from the lobby.");
+    }
+    const competitorNames = this.competitorNames(room, hostPlaying);
+    if (competitorNames.length < 1) {
+      throw new RoomError(
+        "Nobody's playing — tick “I’m playing too” or wait for someone to join."
+      );
+    }
+    const duration = Number.isFinite(durationSec)
+      ? Math.max(30, Math.min(600, Math.round(durationSec)))
+      : WORD_CHAIN_DEFAULT_DURATION_SEC;
+
+    // Hard-prefer a puzzle nobody in the room has played: a Word Chain game is
+    // a single puzzle, so a repeat isn't a mild annoyance the way a repeated
+    // GeoGuessr location is — it hands whoever saw it before the whole game.
+    // Only when this group has collectively played the entire bank does it fall
+    // back to the least-seen chain. Shuffle first so the fallback's stable sort
+    // breaks ties randomly, and so the unseen case is a plain random pick.
+    const seen = await getSeenPuzzleCounts(competitorNames);
+    const unseen = WORD_CHAINS.filter((p) => !seen.has(p.id));
+    const puzzle = shuffle(unseen.length > 0 ? unseen : WORD_CHAINS).sort(
+      (a, b) => (seen.get(a.id) ?? 0) - (seen.get(b.id) ?? 0)
+    )[0];
+
+    room.gameType = "word_chain";
+    room.hostPlaying = hostPlaying;
+    room.settings.roundDurationSec = duration;
+    room.wordRounds = [
+      {
+        id: nanoid(8),
+        puzzleId: puzzle.id,
+        words: [...puzzle.words],
+        progress: new Map<string, WordChainProgress>(),
+        startedAt: 0,
+        durationMs: duration * 1000,
+        closed: false,
+      },
+    ];
+    room.geoRounds = [];
+    room.rounds = [];
+    room.photos = [];
+    room.currentRound = 0;
+    for (const p of room.players.values()) {
+      p.score = 0;
+    }
+    this.beginRound(room);
+  }
+
+  /** This player's run at the current chain, created on first contact. */
+  private wordProgress(
+    round: WordChainRound,
+    playerId: string
+  ): WordChainProgress {
+    let progress = round.progress.get(playerId);
+    if (!progress) {
+      progress = { solved: 0, hints: [], hintsUsed: 0, wrongGuesses: 0 };
+      round.progress.set(playerId, progress);
+    }
+    return progress;
+  }
+
+  /** The round a Word Chain player must be in to act, or a user-facing throw. */
+  private requireWordRound(code: string, playerId: string) {
+    const room = this.requireRoom(code);
+    if (room.gameType !== "word_chain" || room.phase !== "playing") {
+      throw new RoomError("There's nothing to solve right now.");
+    }
+    if (!room.players.has(playerId)) {
+      throw new RoomError("You are not in this room.");
+    }
+    if (this.isSpectator(room, playerId)) {
+      throw new RoomError("You're spectating this game — sit back and watch!");
+    }
+    const round = room.wordRounds[room.currentRound];
+    if (!round || round.closed) {
+      throw new RoomError("This puzzle is already over.");
+    }
+    return { room, round, progress: this.wordProgress(round, playerId) };
+  }
+
+  /**
+   * Answer the blank this player is currently on. Wrong answers cost nothing
+   * but time — the clock is the pressure here, and a guessing penalty would
+   * mostly punish typos.
+   */
+  submitWordGuess(
+    code: string,
+    playerId: string,
+    index: number,
+    guess: string
+  ): WordChainGuessResult {
+    const { room, round, progress } = this.requireWordRound(code, playerId);
+    const blankCount = round.words.length - 2;
+
+    if (progress.finishedMs !== undefined) {
+      return { correct: false, solved: progress.solved, finished: true };
+    }
+    // A mismatched index means the client is answering a blank it has already
+    // moved past (a retried emit, say). Ignore it rather than crediting this
+    // answer to the wrong word.
+    if (index !== progress.solved) {
+      return { correct: false, solved: progress.solved, finished: false };
+    }
+
+    const answer = normalizeWord(round.words[progress.solved + 1]);
+    if (normalizeWord(guess) !== answer) {
+      progress.wrongGuesses += 1;
+      this.touch(room);
+      return { correct: false, solved: progress.solved, finished: false };
+    }
+
+    progress.solved += 1;
+    const finished = progress.solved >= blankCount;
+    if (finished) {
+      progress.finishedMs = Date.now() - round.startedAt;
+    }
+    // Everyone's done — no reason to make the last finisher watch the clock.
+    if (finished && this.allConnectedFinished(room, round)) {
+      this.closeRound(room);
+    }
+    this.touch(room);
+    return { correct: true, solved: progress.solved, finished, word: answer };
+  }
+
+  /**
+   * Buy one more letter of the current blank. Private to the buyer: it changes
+   * only their view and only their score.
+   */
+  revealWordHint(
+    code: string,
+    playerId: string
+  ): { revealed: string; hintsUsed: number } {
+    const { room, round, progress } = this.requireWordRound(code, playerId);
+    if (progress.finishedMs !== undefined) {
+      throw new RoomError("You've already finished the chain.");
+    }
+    const answer = round.words[progress.solved + 1];
+    const bought = progress.hints[progress.solved] ?? 0;
+    const shown = freeLetters(answer) + bought;
+    // The last letter is never for sale — a hint should narrow the guess, not
+    // finish it.
+    if (shown >= answer.length - 1) {
+      throw new RoomError("No more hints for this word.");
+    }
+    progress.hints[progress.solved] = bought + 1;
+    progress.hintsUsed += 1;
+    this.touch(room);
+    return {
+      revealed: answer.slice(0, shown + 1),
+      hintsUsed: progress.hintsUsed,
+    };
+  }
+
+  /** What one player's run is worth. Recomputed rather than accumulated, so
+   * there's one definition of the score and no drift between the live view and
+   * what lands on the scoreboard. */
+  private wordChainPoints(
+    round: WordChainRound,
+    progress: WordChainProgress
+  ): number {
+    let points =
+      progress.solved * WORD_CHAIN_LINK_POINTS -
+      progress.hintsUsed * WORD_CHAIN_HINT_PENALTY;
+    if (progress.finishedMs !== undefined) {
+      const remaining = Math.max(
+        0,
+        1 - progress.finishedMs / round.durationMs
+      );
+      points +=
+        WORD_CHAIN_FINISH_BONUS +
+        Math.round(WORD_CHAIN_SPEED_BONUS_MAX * remaining);
+    }
+    // Hints can't dig a player into the negative.
+    return Math.max(0, points);
+  }
+
+  /**
+   * True when at least one connected competitor exists and all of them have
+   * completed the chain. The Word Chain equivalent of `allConnectedGuessed` —
+   * separate because "done" here is finishing, not having an entry.
+   */
+  private allConnectedFinished(room: Room, round: WordChainRound): boolean {
+    const connected = [...room.players.values()].filter(
+      (p) => p.connected && !this.isSpectator(room, p.id)
+    );
+    return (
+      connected.length > 0 &&
+      connected.every(
+        (p) => round.progress.get(p.id)?.finishedMs !== undefined
+      )
+    );
+  }
+
+  /**
    * True when at least one connected competitor exists and all of them have
    * submitted a guess for `round`. Used to decide when a round can close early.
    * Works for both geo and photo rounds (both key `guesses` by playerId).
@@ -657,7 +935,12 @@ export class RoomStore {
     if (!room) {
       return;
     }
-    if (room.phase === "playing") {
+    if (room.phase === "playing" && room.gameType === "word_chain") {
+      const round = room.wordRounds[room.currentRound];
+      if (round && !round.closed && this.allConnectedFinished(room, round)) {
+        this.closeRound(room);
+      }
+    } else if (room.phase === "playing") {
       const round =
         room.gameType === "geo_guessr"
           ? room.geoRounds[room.currentRound]
@@ -700,12 +983,37 @@ export class RoomStore {
     }, HOST_ABSENT_REVEAL_MS);
   }
 
+  /**
+   * The round currently in play, whichever game this room is running. All three
+   * round shapes carry the same clock fields, which is what lets `beginRound`
+   * and the sweep stay game-agnostic.
+   */
+  private activeRound(room: Room): InternalRound | GeoRound | WordChainRound {
+    switch (room.gameType) {
+      case "geo_guessr":
+        return room.geoRounds[room.currentRound];
+      case "word_chain":
+        return room.wordRounds[room.currentRound];
+      default:
+        return room.rounds[room.currentRound];
+    }
+  }
+
+  /** How many rounds this room's game has in total. */
+  private roundCount(room: Room): number {
+    switch (room.gameType) {
+      case "geo_guessr":
+        return room.geoRounds.length;
+      case "word_chain":
+        return room.wordRounds.length;
+      default:
+        return room.rounds.length;
+    }
+  }
+
   private beginRound(room: Room) {
     room.phase = "playing";
-    const round =
-      room.gameType === "geo_guessr"
-        ? room.geoRounds[room.currentRound]
-        : room.rounds[room.currentRound];
+    const round = this.activeRound(room);
     round.startedAt = Date.now();
     round.closed = false;
     if (room.roundTimer) {
@@ -764,6 +1072,27 @@ export class RoomStore {
   }
 
   private closeRound(room: Room) {
+    if (room.gameType === "word_chain") {
+      const round = room.wordRounds[room.currentRound];
+      if (!round || round.closed) {
+        return;
+      }
+      round.closed = true;
+      if (room.roundTimer) {
+        clearTimeout(room.roundTimer);
+        room.roundTimer = undefined;
+      }
+      for (const [playerId, progress] of round.progress) {
+        const player = room.players.get(playerId);
+        if (player) {
+          player.score += this.wordChainPoints(round, progress);
+        }
+      }
+      room.phase = "reveal";
+      this.maybeScheduleHostAbsentAdvance(room);
+      return;
+    }
+
     if (room.gameType === "geo_guessr") {
       const round = room.geoRounds[room.currentRound];
       if (!round || round.closed) {
@@ -823,11 +1152,7 @@ export class RoomStore {
       clearTimeout(room.autoAdvanceTimer);
       room.autoAdvanceTimer = undefined;
     }
-    const total =
-      room.gameType === "geo_guessr"
-        ? room.geoRounds.length
-        : room.rounds.length;
-    if (room.currentRound + 1 >= total) {
+    if (room.currentRound + 1 >= this.roundCount(room)) {
       room.phase = "final";
       this.touch(room);
       this.onGameFinished(room.code);
@@ -852,6 +1177,7 @@ export class RoomStore {
     room.photos = [];
     room.rounds = [];
     room.geoRounds = [];
+    room.wordRounds = [];
     room.currentRound = 0;
     room.persisted = false;
     room.hostPlaying = false;
@@ -879,15 +1205,11 @@ export class RoomStore {
     const ranked = [...room.players.values()]
       .filter((p) => !this.isSpectator(room, p.id))
       .sort((a, b) => b.score - a.score);
-    const roundCount =
-      room.gameType === "geo_guessr"
-        ? room.geoRounds.length
-        : room.rounds.length;
     return {
       code: room.code,
       gameType: room.gameType,
       hostName: host?.name ?? "Host",
-      roundCount,
+      roundCount: this.roundCount(room),
       players: ranked.map((p, i) => ({
         name: p.name,
         color: p.color,
@@ -898,6 +1220,10 @@ export class RoomStore {
       geoLocationIds:
         room.gameType === "geo_guessr"
           ? room.geoRounds.map((r) => r.locationId)
+          : undefined,
+      wordPuzzleIds:
+        room.gameType === "word_chain"
+          ? room.wordRounds.map((r) => r.puzzleId)
           : undefined,
     };
   }
@@ -932,11 +1258,13 @@ export class RoomStore {
 
   /**
    * How many guesses are in for the current round — the only thing a guess
-   * changes for everyone other than the guesser. Returns null outside a round.
+   * changes for everyone other than the guesser. Returns null outside a round,
+   * and for Word Chain, which broadcasts per-player standings instead (a
+   * single counter can't describe a race).
    */
   answeredCount(code: string): number | null {
     const room = this.getRoom(code);
-    if (!room || room.phase !== "playing") {
+    if (!room || room.phase !== "playing" || room.gameType === "word_chain") {
       return null;
     }
     const round =
@@ -944,6 +1272,26 @@ export class RoomStore {
         ? room.geoRounds[room.currentRound]
         : room.rounds[room.currentRound];
     return round ? round.guesses.size : null;
+  }
+
+  /**
+   * One player's position in the Word Chain race — the whole of what a correct
+   * answer tells everyone else. Returns null when there's nothing to report.
+   */
+  wordStanding(code: string, playerId: string): WordChainStanding | null {
+    const room = this.getRoom(code);
+    if (!room || room.gameType !== "word_chain") {
+      return null;
+    }
+    const progress = room.wordRounds[room.currentRound]?.progress.get(playerId);
+    if (!progress) {
+      return null;
+    }
+    return {
+      playerId,
+      solved: progress.solved,
+      finished: progress.finishedMs !== undefined,
+    };
   }
 
   /** Build the client-facing, role-aware view of a room for one player. */
@@ -974,6 +1322,78 @@ export class RoomStore {
       players,
       settings: room.settings,
     };
+
+    if (room.gameType === "word_chain") {
+      const competitorIds = [...room.players.keys()].filter(
+        (id) => !this.isSpectator(room, id)
+      );
+
+      if (room.phase === "playing" || room.phase === "reveal") {
+        const round = room.wordRounds[room.currentRound];
+        const blanks = round.words.slice(1, -1);
+        const mine = round.progress.get(viewerId);
+        const solved = mine?.solved ?? 0;
+
+        if (room.phase === "playing") {
+          state.wordRound = {
+            puzzleId: round.puzzleId,
+            startWord: round.words[0],
+            endWord: round.words[round.words.length - 1],
+            // The answer for an unsolved blank stays here on the server. What
+            // goes out is its length plus the prefix this viewer has earned —
+            // which is why the view is built per viewer rather than broadcast.
+            blanks: blanks.map((word, i) => ({
+              length: word.length,
+              revealed: word.slice(
+                0,
+                freeLetters(word) + (mine?.hints[i] ?? 0)
+              ),
+              solvedWord: i < solved ? word : undefined,
+            })),
+            activeIndex: solved,
+            endsAt: round.startedAt + round.durationMs,
+            finished: mine?.finishedMs !== undefined,
+            myPoints: mine ? this.wordChainPoints(round, mine) : 0,
+            hintsUsed: mine?.hintsUsed ?? 0,
+            standings: competitorIds.map((id) => {
+              const p = round.progress.get(id);
+              return {
+                playerId: id,
+                solved: p?.solved ?? 0,
+                finished: p?.finishedMs !== undefined,
+              };
+            }),
+            spectating: this.isSpectator(room, viewerId),
+            isHost: viewerId === room.hostId,
+          };
+        } else {
+          state.wordReveal = {
+            puzzleId: round.puzzleId,
+            words: round.words,
+            results: competitorIds
+              .map((id) => {
+                const p = round.progress.get(id);
+                return {
+                  playerId: id,
+                  solved: p?.solved ?? 0,
+                  total: blanks.length,
+                  finished: p?.finishedMs !== undefined,
+                  timeMs: p?.finishedMs ?? null,
+                  hintsUsed: p?.hintsUsed ?? 0,
+                  points: p ? this.wordChainPoints(round, p) : 0,
+                };
+              })
+              .sort((a, b) => b.points - a.points),
+          };
+        }
+      }
+
+      if (room.phase === "final") {
+        state.final = { ranking: this.finalRanking(room) };
+      }
+
+      return state;
+    }
 
     if (room.gameType === "geo_guessr") {
       const competitorCount = [...room.players.keys()].filter(
@@ -1020,12 +1440,7 @@ export class RoomStore {
       }
 
       if (room.phase === "final") {
-        state.final = {
-          ranking: [...room.players.values()]
-            .filter((p) => !this.isSpectator(room, p.id))
-            .sort((a, b) => b.score - a.score)
-            .map((p) => ({ playerId: p.id, score: p.score })),
-        };
+        state.final = { ranking: this.finalRanking(room) };
       }
 
       return state;
@@ -1074,15 +1489,18 @@ export class RoomStore {
     }
 
     if (room.phase === "final") {
-      state.final = {
-        ranking: [...room.players.values()]
-          .filter((p) => !this.isSpectator(room, p.id))
-          .sort((a, b) => b.score - a.score)
-          .map((p) => ({ playerId: p.id, score: p.score })),
-      };
+      state.final = { ranking: this.finalRanking(room) };
     }
 
     return state;
+  }
+
+  /** Competitors, best score first. Spectators never appear. */
+  private finalRanking(room: Room): { playerId: string; score: number }[] {
+    return [...room.players.values()]
+      .filter((p) => !this.isSpectator(room, p.id))
+      .sort((a, b) => b.score - a.score)
+      .map((p) => ({ playerId: p.id, score: p.score }));
   }
 
   /**

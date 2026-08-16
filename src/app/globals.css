@@ -51,6 +51,26 @@ body {
   animation: pop-in 0.25s ease-out both;
 }
 
+/* Wrong-answer nudge. Cleared by the element's own onAnimationEnd, so nothing
+   has to schedule a timer to take the class back off. */
+@keyframes shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  20%,
+  60% {
+    transform: translateX(-6px);
+  }
+  40%,
+  80% {
+    transform: translateX(6px);
+  }
+}
+.animate-shake {
+  animation: shake 0.35s ease-in-out both;
+}
+
 @keyframes float-up {
   0% {
     transform: translateY(0);

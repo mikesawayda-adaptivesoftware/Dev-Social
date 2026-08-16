@@ -24,6 +24,8 @@ import type {
   PublicPlayer,
   RoomState,
   RoomVisibility,
+  WordChainGuessResult,
+  WordChainStanding,
 } from "@/shared/types";
 
 type NoArgEvent =
@@ -61,6 +63,12 @@ interface GameContextValue {
   submitGuess: (choiceId: string) => Promise<void>;
   startGeoGame: (roundDurationSec: number, hostPlaying: boolean) => Promise<void>;
   submitGeoGuess: (lat: number, lng: number) => Promise<void>;
+  startWordChain: (durationSec: number, hostPlaying: boolean) => Promise<void>;
+  submitWordGuess: (
+    index: number,
+    guess: string
+  ) => Promise<WordChainGuessResult>;
+  revealWordHint: () => Promise<{ revealed: string; hintsUsed: number }>;
   nextRound: () => Promise<void>;
   playAgain: () => Promise<void>;
 }
@@ -123,6 +131,27 @@ function applyRoundProgress(
   return state;
 }
 
+function applyChainStanding(
+  state: RoomState | null,
+  standing: WordChainStanding
+): RoomState | null {
+  if (!state?.wordRound) {
+    return state;
+  }
+  // Only ever moves someone already on the board. A standing for an unknown
+  // player would mean our roster is behind, and the snapshot that fixes that
+  // carries their position anyway.
+  return {
+    ...state,
+    wordRound: {
+      ...state.wordRound,
+      standings: state.wordRound.standings.map((s) =>
+        s.playerId === standing.playerId ? standing : s
+      ),
+    },
+  };
+}
+
 export function GameProvider({ children }: { children: React.ReactNode }) {
   const [connected, setConnected] = useState(false);
   const [state, setState] = useState<RoomState | null>(null);
@@ -181,6 +210,8 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     }) => setState((s) => applyPlayerConnection(s, playerId, isConnected));
     const onRoundProgress = ({ answeredCount }: { answeredCount: number }) =>
       setState((s) => applyRoundProgress(s, answeredCount));
+    const onChainStanding = (standing: WordChainStanding) =>
+      setState((s) => applyChainStanding(s, standing));
 
     socket.on("connect", onConnect);
     socket.on("disconnect", onDisconnect);
@@ -188,6 +219,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     socket.on("room:playerJoined", onPlayerJoined);
     socket.on("room:playerConnection", onPlayerConnection);
     socket.on("round:progress", onRoundProgress);
+    socket.on("chain:standing", onChainStanding);
     if (socket.connected) {
       onConnect();
     }
@@ -199,6 +231,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       socket.off("room:playerJoined", onPlayerJoined);
       socket.off("room:playerConnection", onPlayerConnection);
       socket.off("round:progress", onRoundProgress);
+      socket.off("chain:standing", onChainStanding);
     };
   }, []);
 
@@ -447,6 +480,68 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     []
   );
 
+  const startWordChain = useCallback(
+    (durationSec: number, hostPlaying: boolean) =>
+      new Promise<void>((resolve, reject) => {
+        getSocket().emit(
+          "host:startWordChain",
+          { durationSec, hostPlaying },
+          (res: AckResult<{ ok: true }>) => {
+            if (res?.ok) {
+              resolve();
+            } else {
+              reject(new Error(res?.error ?? "Couldn't start the game."));
+            }
+          }
+        );
+      }),
+    []
+  );
+
+  // Resolves for both right and wrong answers — "wrong" isn't an error, it's
+  // the answer. Only a rejected action (not in the room, round over) throws.
+  const submitWordGuess = useCallback(
+    (index: number, guess: string) =>
+      new Promise<WordChainGuessResult>((resolve, reject) => {
+        getSocket().emit(
+          "word:guess",
+          { index, guess },
+          (res: AckResult<WordChainGuessResult>) => {
+            if (res?.ok) {
+              resolve(res);
+            } else {
+              reject(new Error(res?.error ?? "Couldn't submit that answer."));
+            }
+          }
+        );
+      }),
+    []
+  );
+
+  const revealWordHint = useCallback(
+    () =>
+      new Promise<{ revealed: string; hintsUsed: number }>(
+        (resolve, reject) => {
+          const sock = getSocket() as unknown as {
+            emit: (
+              event: "word:hint",
+              ack: (
+                res: AckResult<{ revealed: string; hintsUsed: number }>
+              ) => void
+            ) => void;
+          };
+          sock.emit("word:hint", (res) => {
+            if (res?.ok) {
+              resolve(res);
+            } else {
+              reject(new Error(res?.error ?? "No hint available."));
+            }
+          });
+        }
+      ),
+    []
+  );
+
   const me = useMemo(() => {
     if (!state || !identity) {
       return null;
@@ -475,6 +570,9 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     submitGuess,
     startGeoGame,
     submitGeoGuess,
+    startWordChain,
+    submitWordGuess,
+    revealWordHint,
     nextRound: () => simpleAction("host:nextRound"),
     playAgain: () => simpleAction("host:playAgain"),
   };

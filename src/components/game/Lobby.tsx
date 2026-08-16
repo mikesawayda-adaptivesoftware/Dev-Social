@@ -10,6 +10,8 @@ import {
   GAME_TYPE_LABELS,
   GEO_DEFAULT_DURATION_SEC,
   GEO_DURATION_OPTIONS_SEC,
+  WORD_CHAIN_DEFAULT_DURATION_SEC,
+  WORD_CHAIN_DURATION_OPTIONS_SEC,
   type GameType,
 } from "@/shared/types";
 import { PlayerList, RoomCodeBadge } from "./shared";
@@ -22,13 +24,23 @@ const getOrigin = () => window.location.origin;
 const getServerOrigin = () => "";
 
 export function Lobby() {
-  const { state, isHost, me, setGameType, startSubmission, startGeoGame } =
-    useGame();
+  const {
+    state,
+    isHost,
+    me,
+    setGameType,
+    startSubmission,
+    startGeoGame,
+    startWordChain,
+  } = useGame();
   const origin = useSyncExternalStore(subscribeNoop, getOrigin, getServerOrigin);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [geoDuration, setGeoDuration] = useState<number>(
     GEO_DEFAULT_DURATION_SEC
+  );
+  const [wordDuration, setWordDuration] = useState<number>(
+    WORD_CHAIN_DEFAULT_DURATION_SEC
   );
   const [hostPlaying, setHostPlaying] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -43,10 +55,22 @@ export function Lobby() {
   // public games list) sees the same selection.
   const selected = state.gameType;
 
-  const notEnough = state.players.length < 2;
+  // Word Chain is a race against a clock rather than against a room, so it's
+  // playable alone — a host on their own just needs to be in it. The other
+  // games still need someone to play against.
+  const competitors = hostPlaying
+    ? state.players.length
+    : state.players.length - 1;
+  const notEnough =
+    selected === "word_chain" ? competitors < 1 : state.players.length < 2;
 
   function pickGame(gameType: GameType) {
     setError(null);
+    if (gameType === "word_chain") {
+      // Solo is a normal way to play this one, so opt the host in by default;
+      // they can still untick it to run the big screen for everyone else.
+      setHostPlaying(true);
+    }
     setGameType(gameType).catch((e) =>
       setError(e instanceof Error ? e.message : "Couldn't switch the game.")
     );
@@ -82,6 +106,8 @@ export function Lobby() {
     try {
       if (selected === "geo_guessr") {
         await startGeoGame(geoDuration, hostPlaying);
+      } else if (selected === "word_chain") {
+        await startWordChain(wordDuration, hostPlaying);
       } else {
         await startSubmission();
       }
@@ -164,40 +190,44 @@ export function Lobby() {
               <p className="mb-2 text-sm font-semibold text-white/70">
                 Time per location
               </p>
-              <div className="flex gap-2">
-                {GEO_DURATION_OPTIONS_SEC.map((sec) => (
-                  <button
-                    key={sec}
-                    onClick={() => setGeoDuration(sec)}
-                    className={`flex-1 rounded-xl border-2 px-3 py-2 text-sm font-semibold transition-all ${
-                      geoDuration === sec
-                        ? "border-fuchsia-400 bg-fuchsia-400/15"
-                        : "border-white/10 bg-white/5 hover:border-white/30"
-                    }`}
-                  >
-                    {sec}s
-                  </button>
-                ))}
-              </div>
+              <DurationPicker
+                options={GEO_DURATION_OPTIONS_SEC}
+                value={geoDuration}
+                onChange={setGeoDuration}
+                format={(sec) => `${sec}s`}
+              />
               <p className="mt-2 text-xs text-white/40">
                 5 locations · guess by distance. Needs a Google Maps key.
               </p>
+              <HostPlayingToggle
+                checked={hostPlaying}
+                onChange={setHostPlaying}
+                verb="Guess"
+              />
+            </div>
+          )}
 
-              <label className="mt-3 flex cursor-pointer items-center gap-3 rounded-xl border border-white/10 bg-white/5 p-3">
-                <input
-                  type="checkbox"
-                  checked={hostPlaying}
-                  onChange={(e) => setHostPlaying(e.target.checked)}
-                  className="h-5 w-5 accent-fuchsia-500"
-                />
-                <span className="text-sm">
-                  <span className="font-semibold">I&apos;m playing too</span>
-                  <span className="block text-xs text-white/40">
-                    Guess from this device. Off = you run the screen and stay off
-                    the scoreboard.
-                  </span>
-                </span>
-              </label>
+          {selected === "word_chain" && (
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-left">
+              <p className="mb-2 text-sm font-semibold text-white/70">
+                Time limit
+              </p>
+              <DurationPicker
+                options={WORD_CHAIN_DURATION_OPTIONS_SEC}
+                value={wordDuration}
+                onChange={setWordDuration}
+                format={(sec) => `${sec / 60} min`}
+              />
+              <p className="mt-2 text-xs text-white/40">
+                One puzzle, everyone racing the same clock. Nobody is dealt a
+                chain they&apos;ve played before — and this one&apos;s fine to
+                play solo.
+              </p>
+              <HostPlayingToggle
+                checked={hostPlaying}
+                onChange={setHostPlaying}
+                verb="Solve"
+              />
             </div>
           )}
 
@@ -208,9 +238,7 @@ export function Lobby() {
           >
             {notEnough
               ? "Waiting for players…"
-              : selected === "geo_guessr"
-                ? "Start Real GeoGuessr →"
-                : "Start Photo Guessr →"}
+              : `Start ${GAME_TYPE_LABELS[selected]} →`}
           </Button>
           {error && (
             <p className="text-sm text-red-300">{error}</p>
@@ -233,5 +261,67 @@ export function Lobby() {
         </div>
       )}
     </div>
+  );
+}
+
+/** Row of timer choices. Each game brings its own options and its own way of
+ * writing them — seconds read better for a per-location clock, minutes for a
+ * whole-game one. */
+function DurationPicker({
+  options,
+  value,
+  onChange,
+  format,
+}: {
+  options: readonly number[];
+  value: number;
+  onChange: (sec: number) => void;
+  format: (sec: number) => string;
+}) {
+  return (
+    <div className="flex gap-2">
+      {options.map((sec) => (
+        <button
+          key={sec}
+          onClick={() => onChange(sec)}
+          className={`flex-1 rounded-xl border-2 px-3 py-2 text-sm font-semibold transition-all ${
+            value === sec
+              ? "border-fuchsia-400 bg-fuchsia-400/15"
+              : "border-white/10 bg-white/5 hover:border-white/30"
+          }`}
+        >
+          {format(sec)}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Whether the host competes or just runs the big screen. */
+function HostPlayingToggle({
+  checked,
+  onChange,
+  verb,
+}: {
+  checked: boolean;
+  onChange: (value: boolean) => void;
+  verb: string;
+}) {
+  return (
+    <label className="mt-3 flex cursor-pointer items-center gap-3 rounded-xl border border-white/10 bg-white/5 p-3">
+      <input
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        className="h-5 w-5 accent-fuchsia-500"
+      />
+      <span className="text-sm">
+        <span className="font-semibold">I&apos;m playing too</span>
+        <span className="block text-xs text-white/40">
+          {verb} from this device. Off = you run the screen and stay off the
+          scoreboard.
+        </span>
+      </span>
+    </label>
   );
 }

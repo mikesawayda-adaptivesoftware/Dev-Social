@@ -331,6 +331,68 @@ io.on("connection", (socket) => {
   socket.on("geo:guess", ({ lat, lng }, ack) =>
     withGuess((code, pid) => store.submitGeoGuess(code, pid, lat, lng), ack)
   );
+  socket.on("host:startWordChain", async ({ durationSec, hostPlaying }, ack) => {
+    const { code, playerId } = socket.data;
+    if (!code || !playerId) {
+      ack?.({ ok: false, error: "You are not in a room." });
+      return;
+    }
+    try {
+      await store.startWordChainGame(code, playerId, durationSec, hostPlaying);
+      ack?.(ok({ ok: true as const }));
+      broadcastRoom(code);
+    } catch (err) {
+      ack?.(fail(err) as never);
+    }
+  });
+  /**
+   * A word chain answer. Same shape as `withGuess` but with its own delta: what
+   * the rest of the room needs is *this* player's new position, not a counter,
+   * because everyone's racing on their own. Wrong answers tell nobody anything,
+   * so they cost one ack and nothing else.
+   */
+  socket.on("word:guess", ({ index, guess }, ack) => {
+    const { code, playerId } = socket.data;
+    if (!code || !playerId) {
+      ack?.({ ok: false, error: "You are not in a room." });
+      return;
+    }
+    try {
+      const phaseBefore = store.getRoom(code)?.phase;
+      const result = store.submitWordGuess(code, playerId, index, guess);
+      ack?.(ok(result));
+      if (store.getRoom(code)?.phase !== phaseBefore) {
+        // That answer ended the round — everyone needs the reveal.
+        broadcastRoom(code);
+        return;
+      }
+      if (result.correct) {
+        const standing = store.wordStanding(code, playerId);
+        if (standing) {
+          socket.to(code).emit("chain:standing", standing);
+        }
+        sendSnapshot(code, playerId, socket.id);
+      }
+    } catch (err) {
+      ack?.(fail(err) as never);
+    }
+  });
+  socket.on("word:hint", (ack) => {
+    const { code, playerId } = socket.data;
+    if (!code || !playerId) {
+      ack?.({ ok: false, error: "You are not in a room." });
+      return;
+    }
+    try {
+      // A hint is private: it moves one player's letters and one player's
+      // score, so only they hear about it.
+      const result = store.revealWordHint(code, playerId);
+      ack?.(ok(result));
+      sendSnapshot(code, playerId, socket.id);
+    } catch (err) {
+      ack?.(fail(err) as never);
+    }
+  });
   socket.on("host:nextRound", (ack) =>
     withRoom((code, pid) => store.nextRound(code, pid), ack)
   );

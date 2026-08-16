@@ -71,6 +71,8 @@ export interface FinishedGame {
   // For geo_guessr: the curated location ids shown this game, recorded per
   // competitor so future games can avoid repeating them.
   geoLocationIds?: string[];
+  // Same idea for word_chain: the seeded puzzle ids played this game.
+  wordPuzzleIds?: string[];
 }
 
 /** Persist a completed game and its players for the season leaderboard. */
@@ -111,11 +113,14 @@ export async function persistFinishedGame(game: FinishedGame): Promise<void> {
       console.error("Failed to persist players:", playersErr.message);
     }
 
-    // Record which locations each competitor saw (geo games only) so future
-    // games can steer away from repeats.
+    // Record which content each competitor saw so future games can steer away
+    // from repeats.
+    const nameKeys = game.players.map((p) => p.name);
     if (game.gameType === "geo_guessr" && game.geoLocationIds?.length) {
-      const nameKeys = game.players.map((p) => p.name);
       await recordSeenLocations(nameKeys, game.geoLocationIds);
+    }
+    if (game.gameType === "word_chain" && game.wordPuzzleIds?.length) {
+      await recordSeenPuzzles(nameKeys, game.wordPuzzleIds);
     }
   } catch (err) {
     console.error("persistFinishedGame error:", err);
@@ -222,46 +227,68 @@ export async function isNameClaimed(name: string): Promise<boolean> {
   }
 }
 
-// ---- Per-player GeoGuessr location history ----
+// ---- Per-player content history ----
+//
+// Both GeoGuessr and Word Chain draw from a fixed bank and want to avoid
+// re-dealing content a player has already had. The two tables are the same
+// shape — (name_key, <content id>, last_seen_at) — so the read and write live
+// here once and each game just names its table and id column.
+
+interface SeenTable {
+  table: string;
+  idColumn: string;
+}
+
+const SEEN_LOCATIONS: SeenTable = {
+  table: "player_locations_seen",
+  idColumn: "location_id",
+};
+
+const SEEN_PUZZLES: SeenTable = {
+  table: "player_word_chains_seen",
+  idColumn: "puzzle_id",
+};
 
 /**
- * Record that each of the given players (by name) has now seen each of the given
- * location ids. Upserts so re-seeing a location just refreshes last_seen_at.
- * No-op in local mode.
+ * Record that each of the given players (by name) has now seen each of the
+ * given content ids. Upserts, so re-seeing something just refreshes
+ * last_seen_at. No-op in local mode.
  */
-export async function recordSeenLocations(
+async function recordSeen(
+  { table, idColumn }: SeenTable,
   names: string[],
-  locationIds: string[]
+  ids: string[]
 ): Promise<void> {
-  if (!supabase || names.length === 0 || locationIds.length === 0) {
+  if (!supabase || names.length === 0 || ids.length === 0) {
     return;
   }
   const now = new Date().toISOString();
   const keys = [...new Set(names.map(nameKey).filter(Boolean))];
   const rows = keys.flatMap((name_key) =>
-    locationIds.map((location_id) => ({ name_key, location_id, last_seen_at: now }))
+    ids.map((id) => ({ name_key, [idColumn]: id, last_seen_at: now }))
   );
   if (rows.length === 0) {
     return;
   }
   try {
     const { error } = await supabase
-      .from("player_locations_seen")
-      .upsert(rows, { onConflict: "name_key,location_id" });
+      .from(table)
+      .upsert(rows, { onConflict: `name_key,${idColumn}` });
     if (error) {
-      console.error("recordSeenLocations failed:", error.message);
+      console.error(`recordSeen(${table}) failed:`, error.message);
     }
   } catch (err) {
-    console.error("recordSeenLocations error:", err);
+    console.error(`recordSeen(${table}) error:`, err);
   }
 }
 
 /**
- * For the given players (by name), return how many of them have already seen
- * each location id. Powers the soft "prefer unseen" ordering at game start.
- * Returns an empty map in local mode (so selection stays purely random).
+ * For the given players (by name), how many of them have already seen each
+ * content id. Drives the "prefer unseen" selection at game start. Returns an
+ * empty map in local mode, so selection there stays purely random.
  */
-export async function getSeenCounts(
+async function getSeen(
+  { table, idColumn }: SeenTable,
   names: string[]
 ): Promise<Map<string, number>> {
   const counts = new Map<string, number>();
@@ -274,20 +301,48 @@ export async function getSeenCounts(
   }
   try {
     const { data, error } = await supabase
-      .from("player_locations_seen")
-      .select("location_id")
+      .from(table)
+      .select(idColumn)
       .in("name_key", keys);
     if (error) {
-      console.error("getSeenCounts failed:", error.message);
+      console.error(`getSeen(${table}) failed:`, error.message);
       return counts;
     }
-    for (const row of data ?? []) {
-      const id = (row as { location_id: string }).location_id;
+    // `select()` with a column name the compiler can't see through gives up on
+    // the row type, so name it ourselves.
+    for (const row of (data ?? []) as unknown as Record<string, string>[]) {
+      const id = row[idColumn];
       counts.set(id, (counts.get(id) ?? 0) + 1);
     }
     return counts;
   } catch (err) {
-    console.error("getSeenCounts error:", err);
+    console.error(`getSeen(${table}) error:`, err);
     return counts;
   }
+}
+
+/** GeoGuessr: which curated locations these players have already been shown. */
+export function getSeenCounts(names: string[]): Promise<Map<string, number>> {
+  return getSeen(SEEN_LOCATIONS, names);
+}
+
+export function recordSeenLocations(
+  names: string[],
+  locationIds: string[]
+): Promise<void> {
+  return recordSeen(SEEN_LOCATIONS, names, locationIds);
+}
+
+/** Word Chain: which seeded puzzles these players have already been dealt. */
+export function getSeenPuzzleCounts(
+  names: string[]
+): Promise<Map<string, number>> {
+  return getSeen(SEEN_PUZZLES, names);
+}
+
+export function recordSeenPuzzles(
+  names: string[],
+  puzzleIds: string[]
+): Promise<void> {
+  return recordSeen(SEEN_PUZZLES, names, puzzleIds);
 }

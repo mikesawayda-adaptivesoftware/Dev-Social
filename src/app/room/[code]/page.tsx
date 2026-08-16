@@ -11,6 +11,8 @@ import { Reveal } from "@/components/game/Reveal";
 import { Final } from "@/components/game/Final";
 import { GeoPlaying } from "@/components/game/geo/GeoPlaying";
 import { GeoReveal } from "@/components/game/geo/GeoReveal";
+import { WordChainPlaying } from "@/components/game/word/WordChainPlaying";
+import { WordChainReveal } from "@/components/game/word/WordChainReveal";
 
 export default function RoomPage() {
   const params = useParams();
@@ -106,12 +108,19 @@ export default function RoomPage() {
 
       <div className="flex flex-1 flex-col">
         {state.phase === "lobby" && <Lobby />}
-        {state.gameType === "geo_guessr" ? (
+        {state.gameType === "geo_guessr" && (
           <>
             {state.phase === "playing" && <GeoPlaying />}
             {state.phase === "reveal" && <GeoReveal />}
           </>
-        ) : (
+        )}
+        {state.gameType === "word_chain" && (
+          <>
+            {state.phase === "playing" && <WordChainPlaying />}
+            {state.phase === "reveal" && <WordChainReveal />}
+          </>
+        )}
+        {state.gameType === "photo_guessr" && (
           <>
             {state.phase === "submission" && <Submission />}
             {state.phase === "playing" && <Playing />}
