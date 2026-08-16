@@ -1,0 +1,70 @@
+# Dev Social on the Unraid host (192.168.0.248).
+#
+# Pull-only: there is no `build:` key here on purpose. CI builds the image and
+# pushes it to GHCR; Watchtower on this box polls, pulls and restarts. Nothing
+# is ever built on Unraid, and nothing outside the LAN needs to reach it.
+#
+# The root docker-compose.yml is the *local build* file — a different job. Do
+# not merge the two.
+#
+# On the box, this file lives at /mnt/user/appdata/dev-social/docker-compose.yml
+# with a .env beside it (see .env.unraid.example). Copy it over only when this
+# file changes; image updates need no action at all.
+#
+#   docker compose pull && docker compose up -d
+#
+# Secrets come from ./.env, which exists only on that host. Nothing in this file
+# and nothing in the image contains a credential.
+
+services:
+  dev-social:
+    image: ghcr.io/mikesawayda-adaptivesoftware/dev-social:latest
+    container_name: dev-social
+    restart: unless-stopped
+
+    ports:
+      # left = host, right = container. Nginx Proxy Manager fronts both on one
+      # origin: / -> 3092, /socket.io/ -> 3093. Changing the host side needs no
+      # rebuild — the baked public origin is unchanged.
+      - "3092:3000" # Next.js app
+      - "3093:3001" # Socket.IO game server
+
+    # SUPABASE_SERVICE_ROLE_KEY and GOOGLE_MAPS_API_KEY. Host-local, gitignored,
+    # chmod 600. This replaces the old single-value `service_role` file and the
+    # -e flags that had to be re-pasted into an SSH session on every update.
+    env_file:
+      - .env
+
+    environment:
+      NODE_ENV: production
+      # Locks Socket.IO CORS to the public origin (the code default is "*").
+      GAME_CLIENT_ORIGIN: "https://dev-social.adaptivesoftware.co"
+      SUPABASE_URL: "https://dlfjcxnnmtkzupvhdivw.supabase.co"
+
+    labels:
+      # Belt-and-braces: Watchtower on this host is unscoped today, so it would
+      # pick the container up regardless. This keeps that true if it is ever
+      # switched to WATCHTOWER_LABEL_ENABLE.
+      com.centurylinklabs.watchtower.enable: "true"
+
+    healthcheck:
+      # node, not wget or curl — node is guaranteed present (it is the runtime)
+      # and has global fetch on 22. 127.0.0.1 rather than localhost because the
+      # server binds 0.0.0.0 (IPv4 only) and localhost can resolve to ::1 first.
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'

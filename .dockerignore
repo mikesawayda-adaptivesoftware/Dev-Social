@@ -17,9 +17,18 @@ npm-debug.log*
 .env
 .env.*
 
-# Build/deploy artifacts not needed inside the image.
+# Build/deploy artifacts not needed inside the image. The build stage does
+# COPY . ., so anything left in here busts the cache on every doc or CI edit.
 Dockerfile
 .dockerignore
 docker-compose.yml
+infra
+.github
+.claude
+supabase
+scripts/smoke*.mjs
 README.md
 GAME_IDEAS.md
+QUICK_DEPLOY.md
+AGENTS.md
+CLAUDE.md

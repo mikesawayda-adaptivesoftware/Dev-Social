@@ -9,7 +9,8 @@
     "build": "next build",
     "start": "concurrently -n next,game -c blue,magenta \"next start\" \"npm:start:game\"",
     "start:game": "tsx server/index.ts",
-    "lint": "eslint"
+    "lint": "eslint",
+    "docker:local": "docker compose up --build"
   },
   "dependencies": {
     "@googlemaps/js-api-loader": "^2.1.1",

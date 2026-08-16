@@ -33,10 +33,12 @@ ARG NEXT_PUBLIC_GAME_SERVER_URL
 ARG NEXT_PUBLIC_SUPABASE_URL
 ARG NEXT_PUBLIC_SUPABASE_ANON_KEY
 ARG NEXT_PUBLIC_GOOGLE_MAPS_API_KEY
+ARG NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID
 ENV NEXT_PUBLIC_GAME_SERVER_URL=$NEXT_PUBLIC_GAME_SERVER_URL \
     NEXT_PUBLIC_SUPABASE_URL=$NEXT_PUBLIC_SUPABASE_URL \
     NEXT_PUBLIC_SUPABASE_ANON_KEY=$NEXT_PUBLIC_SUPABASE_ANON_KEY \
     NEXT_PUBLIC_GOOGLE_MAPS_API_KEY=$NEXT_PUBLIC_GOOGLE_MAPS_API_KEY \
+    NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID=$NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID \
     NEXT_TELEMETRY_DISABLED=1
 
 RUN npm run build
@@ -44,9 +46,16 @@ RUN npm run build
 # ---- runner: runtime image that runs both processes ----
 FROM node:${NODE_VERSION} AS runner
 WORKDIR /app
+
+# The commit this image was built from, reported by /api/health and the game
+# server's /health. Watchtower updates the container silently, so this is the
+# only way to tell from outside the LAN which code is actually live.
+ARG BUILD_SHA=dev
+
 ENV NODE_ENV=production \
     NEXT_TELEMETRY_DISABLED=1 \
-    HOSTNAME=0.0.0.0
+    HOSTNAME=0.0.0.0 \
+    BUILD_SHA=$BUILD_SHA
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/.next ./.next

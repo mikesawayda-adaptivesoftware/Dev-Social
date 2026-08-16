@@ -1,11 +1,13 @@
-# Dev Social — single-container deploy (Next.js app + Socket.IO game server).
+# Dev Social — LOCAL build of the single container (Next.js app + Socket.IO
+# game server). This is a dev-machine convenience, not the deploy path.
 #
-# Usage:
 #   1. cp .env.docker.example .env   # then paste your service_role key
-#   2. docker compose up -d --build
+#   2. npm run docker:local          # docker compose up --build
 #
-# Front it with nginx (see README "Deploy" section): route /socket.io/ -> 3001
-# and everything else -> 3000 on https://dev-social.adaptivesoftware.co.
+# Production is built by CI and delivered to Unraid by Watchtower — see
+# infra/docker-compose.yml and QUICK_DEPLOY.md. Nothing here is used in prod;
+# the values below are duplicated from the repo's GitHub Variables so a local
+# build resembles the real one.
 
 services:
   devsocial:
@@ -22,6 +24,9 @@ services:
         # in the Google Cloud Console. Empty by default (GeoGuessr shows a setup
         # hint until it's provided).
         NEXT_PUBLIC_GOOGLE_MAPS_API_KEY: "${NEXT_PUBLIC_GOOGLE_MAPS_API_KEY:-}"
+        # Falls back to "DEMO_MAP_ID" in src/lib/googleMaps.ts when unset.
+        NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID: "${NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID:-}"
+        BUILD_SHA: "local"
     image: devsocial:latest
     container_name: devsocial
     restart: unless-stopped
@@ -44,8 +49,17 @@ services:
       - path: .env
         required: false
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      # node, not wget — node is the runtime so it is guaranteed present, and it
+      # has global fetch on 22. 127.0.0.1 rather than localhost because the
+      # server binds 0.0.0.0 (IPv4 only) and localhost can resolve to ::1 first.
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 30s
