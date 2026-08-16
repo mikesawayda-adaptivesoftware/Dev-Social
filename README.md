@@ -11,8 +11,8 @@ Three games ship today:
   correct guesses, bonus points for speed.
 - **Real GeoGuessr** — each player is dropped into an interactive Street View on
   their phone, explores, and drops a pin on a world map. You score by how close
-  your pin is to the true location. (Needs a Google Maps API key — see
-  [Google Maps setup](#google-maps-setup-for-real-geoguessr).)
+  your pin is to the true location. Plays fine solo. (Needs a Google Maps API
+  key — see [Google Maps setup](#google-maps-setup-for-real-geoguessr).)
 - **Word Chain** — everyone races the same clock on one seeded chain of words,
   where each neighbouring pair makes a compound word (SUN·FLOWER·BED·ROOM). Fill
   the blanks between the two ends before the timer runs out. Plays fine solo.
@@ -63,7 +63,8 @@ phones using your machine's network URL (printed by Next as `Network:`), e.g.
 1. **Host** creates a room and, in the lobby, picks **Real GeoGuessr**, the time
    per location (60 / 90 / 120s), and whether they're **playing too** or just
    running the big screen.
-2. Everyone **joins** from their phone with the code + their name.
+2. Everyone **joins** from their phone with the code + their name — or nobody
+   does, and the host plays alone against the clock.
 3. Host starts → each round drops **every player into the same Street View**
    location, which they explore independently on their phone.
 4. Players pan/move around, then **drop a pin** on the world map and lock it in.
@@ -78,13 +79,19 @@ phones using your machine's network URL (printed by Next as `Network:`), e.g.
 > scoreboard entirely). Toggle **"I'm playing too"** in the lobby to have the
 > host guess from their device and appear in the standings. All players in a
 > game get the same 5 locations, drawn once when the game starts.
+>
+> **Playing solo works.** GeoGuessr and Word Chain both need one competitor, not
+> two — a lone player still has a clock, a score and a leaderboard row. A host
+> alone in the room is by definition the one playing, so the lobby ticks and
+> locks "I'm playing too" until somebody else joins. Only Photo Guessr still
+> needs a crowd, because it needs photos from two different people.
 
 ## How to play (Word Chain)
 
 1. **Host** creates a room and, in the lobby, picks **Word Chain** and the time
    limit (**1 / 2 / 5 minutes**). "I'm playing too" is on by default here.
 2. Everyone **joins** from their phone with the code + their name. One player is
-   fine — you're racing the clock either way.
+   fine — you're racing the clock either way (see the solo note above).
 3. Host starts → everyone gets **the same chain** at the same time: two words
    given, four blanks between them. Each neighbouring pair makes a compound word
    or set phrase, so `KEY · ? · ? · ? · ? · PUNCH` resolves to

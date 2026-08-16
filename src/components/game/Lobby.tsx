@@ -23,6 +23,9 @@ const subscribeNoop = () => () => {};
 const getOrigin = () => window.location.origin;
 const getServerOrigin = () => "";
 
+const SOLO_NOTE =
+  "You're the only one here, so you're playing. This unlocks when someone else joins.";
+
 export function Lobby() {
   const {
     state,
@@ -55,20 +58,26 @@ export function Lobby() {
   // public games list) sees the same selection.
   const selected = state.gameType;
 
-  // Word Chain is a race against a clock rather than against a room, so it's
-  // playable alone — a host on their own just needs to be in it. The other
-  // games still need someone to play against.
-  const competitors = hostPlaying
+  // Photo Guessr needs photos from two different people, so it really does need
+  // a room. GeoGuessr and Word Chain are you against a clock, and play fine
+  // alone.
+  const soloCapable = selected !== "photo_guessr";
+  // A host by themselves can only be a player — a game with nobody competing
+  // isn't a game. Derived rather than stored, so it also covers the lobby's
+  // default game, which the host reaches without clicking a card at all.
+  const alone = state.players.length === 1;
+  const hostWillPlay = hostPlaying || (alone && soloCapable);
+  const competitors = hostWillPlay
     ? state.players.length
     : state.players.length - 1;
-  const notEnough =
-    selected === "word_chain" ? competitors < 1 : state.players.length < 2;
+  const notEnough = soloCapable ? competitors < 1 : state.players.length < 2;
 
   function pickGame(gameType: GameType) {
     setError(null);
     if (gameType === "word_chain") {
-      // Solo is a normal way to play this one, so opt the host in by default;
-      // they can still untick it to run the big screen for everyone else.
+      // Everyone solves their own chain, so the host joining in is the norm
+      // here rather than the exception. They can still untick it to run the
+      // big screen. (GeoGuessr keeps its host-on-the-big-screen default.)
       setHostPlaying(true);
     }
     setGameType(gameType).catch((e) =>
@@ -105,9 +114,9 @@ export function Lobby() {
     setError(null);
     try {
       if (selected === "geo_guessr") {
-        await startGeoGame(geoDuration, hostPlaying);
+        await startGeoGame(geoDuration, hostWillPlay);
       } else if (selected === "word_chain") {
-        await startWordChain(wordDuration, hostPlaying);
+        await startWordChain(wordDuration, hostWillPlay);
       } else {
         await startSubmission();
       }
@@ -200,9 +209,10 @@ export function Lobby() {
                 5 locations · guess by distance. Needs a Google Maps key.
               </p>
               <HostPlayingToggle
-                checked={hostPlaying}
+                checked={hostWillPlay}
                 onChange={setHostPlaying}
                 verb="Guess"
+                lockedNote={alone ? SOLO_NOTE : undefined}
               />
             </div>
           )}
@@ -220,13 +230,13 @@ export function Lobby() {
               />
               <p className="mt-2 text-xs text-white/40">
                 One puzzle, everyone racing the same clock. Nobody is dealt a
-                chain they&apos;ve played before — and this one&apos;s fine to
-                play solo.
+                chain they&apos;ve played before.
               </p>
               <HostPlayingToggle
-                checked={hostPlaying}
+                checked={hostWillPlay}
                 onChange={setHostPlaying}
                 verb="Solve"
+                lockedNote={alone ? SOLO_NOTE : undefined}
               />
             </div>
           )}
@@ -297,29 +307,43 @@ function DurationPicker({
   );
 }
 
-/** Whether the host competes or just runs the big screen. */
+/**
+ * Whether the host competes or just runs the big screen.
+ *
+ * `lockedNote` covers the case where there's no choice left to make — a host
+ * alone in the room is the only possible player — and says why, instead of
+ * leaving a live-looking checkbox whose other setting has no valid outcome.
+ */
 function HostPlayingToggle({
   checked,
   onChange,
   verb,
+  lockedNote,
 }: {
   checked: boolean;
   onChange: (value: boolean) => void;
   verb: string;
+  lockedNote?: string;
 }) {
+  const locked = Boolean(lockedNote);
   return (
-    <label className="mt-3 flex cursor-pointer items-center gap-3 rounded-xl border border-white/10 bg-white/5 p-3">
+    <label
+      className={`mt-3 flex items-center gap-3 rounded-xl border border-white/10 bg-white/5 p-3 ${
+        locked ? "" : "cursor-pointer"
+      }`}
+    >
       <input
         type="checkbox"
         checked={checked}
+        disabled={locked}
         onChange={(e) => onChange(e.target.checked)}
-        className="h-5 w-5 accent-fuchsia-500"
+        className="h-5 w-5 accent-fuchsia-500 disabled:opacity-60"
       />
       <span className="text-sm">
         <span className="font-semibold">I&apos;m playing too</span>
         <span className="block text-xs text-white/40">
-          {verb} from this device. Off = you run the screen and stay off the
-          scoreboard.
+          {lockedNote ??
+            `${verb} from this device. Off = you run the screen and stay off the scoreboard.`}
         </span>
       </span>
     </label>
