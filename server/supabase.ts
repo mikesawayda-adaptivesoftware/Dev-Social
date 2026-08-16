@@ -73,6 +73,19 @@ export interface FinishedGame {
   geoLocationIds?: string[];
   // Same idea for word_chain: the seeded puzzle ids played this game.
   wordPuzzleIds?: string[];
+  // …and for draw_it: the words that actually got drawn.
+  drawWordIds?: string[];
+  // Each round's drawing, kept for the leaderboard gallery.
+  drawings?: {
+    word: string;
+    drawerName: string;
+    drawerColor: string;
+    /** The drawer's points — the share of the room that guessed it. */
+    score: number;
+    solved: number;
+    guessers: number;
+    strokes: unknown;
+  }[];
 }
 
 /** Persist a completed game and its players for the season leaderboard. */
@@ -121,6 +134,29 @@ export async function persistFinishedGame(game: FinishedGame): Promise<void> {
     }
     if (game.gameType === "word_chain" && game.wordPuzzleIds?.length) {
       await recordSeenPuzzles(nameKeys, game.wordPuzzleIds);
+    }
+    if (game.gameType === "draw_it" && game.drawWordIds?.length) {
+      await recordSeenDrawWords(nameKeys, game.drawWordIds);
+    }
+
+    // Drawings are a bonus, not part of the result — a failure here must not
+    // cost anyone their scores, which are already safely written above.
+    if (game.drawings?.length) {
+      const { error } = await supabase.from("game_drawings").insert(
+        game.drawings.map((d) => ({
+          game_id: gameRow.id,
+          word: d.word,
+          drawer_name: d.drawerName,
+          drawer_color: d.drawerColor,
+          score: d.score,
+          solved: d.solved,
+          guessers: d.guessers,
+          strokes: d.strokes,
+        }))
+      );
+      if (error) {
+        console.error("Failed to persist drawings:", error.message);
+      }
     }
   } catch (err) {
     console.error("persistFinishedGame error:", err);
@@ -249,6 +285,11 @@ const SEEN_PUZZLES: SeenTable = {
   idColumn: "puzzle_id",
 };
 
+const SEEN_DRAW_WORDS: SeenTable = {
+  table: "player_draw_words_seen",
+  idColumn: "word_id",
+};
+
 /**
  * Record that each of the given players (by name) has now seen each of the
  * given content ids. Upserts, so re-seeing something just refreshes
@@ -345,4 +386,18 @@ export function recordSeenPuzzles(
   puzzleIds: string[]
 ): Promise<void> {
   return recordSeen(SEEN_PUZZLES, names, puzzleIds);
+}
+
+/** Draw It: which words these players have already been dealt. */
+export function getSeenDrawCounts(
+  names: string[]
+): Promise<Map<string, number>> {
+  return getSeen(SEEN_DRAW_WORDS, names);
+}
+
+export function recordSeenDrawWords(
+  names: string[],
+  wordIds: string[]
+): Promise<void> {
+  return recordSeen(SEEN_DRAW_WORDS, names, wordIds);
 }

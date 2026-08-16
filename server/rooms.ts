@@ -4,6 +4,12 @@ import {
   DEFAULT_SETTINGS,
   GEO_DEFAULT_DURATION_SEC,
   MAX_PLAYERS_PER_ROOM,
+  DRAW_CANVAS_UNITS,
+  DRAW_COLORS,
+  DRAW_DEFAULT_DURATION_SEC,
+  DRAW_MAX_ROUNDS,
+  DRAW_PICK_SECONDS,
+  DRAW_WIDTHS,
   WORD_CHAIN_DEFAULT_DURATION_SEC,
   WORD_CHAIN_DEFAULT_LENGTH,
   isGameEnabled,
@@ -15,16 +21,22 @@ import {
   type PublicPlayer,
   type PublicRoomSummary,
   type RoomVisibility,
+  type DrawChatLine,
+  type DrawDifficultyChoice,
+  type DrawGuessResult,
+  type DrawStroke,
   type WordChainDifficulty,
   type WordChainDifficultyChoice,
   type WordChainGuessResult,
   type WordChainStanding,
 } from "../src/shared/types";
+import { DRAW_WORDS, maskWord, normalizeGuess, type DrawWord } from "./drawWords";
 import { GEO_LOCATIONS, resolvePano } from "./geoLocations";
 import { WORD_CHAINS, freeLetters, normalizeWord } from "./wordChains";
 import {
   claimOrVerifyName,
   getSeenCounts,
+  getSeenDrawCounts,
   getSeenPuzzleCounts,
   type FinishedGame,
 } from "./supabase";
@@ -154,6 +166,35 @@ interface WordChainRound {
   closed: boolean;
 }
 
+interface DrawGuessRecord {
+  correct: boolean;
+  timeMs: number;
+  points: number;
+}
+
+/**
+ * One player's turn at the easel.
+ *
+ * `word` is empty until they pick, which is what separates the `picking` phase
+ * from `playing` — there is nothing to draw or guess until it's set.
+ */
+interface DrawRound {
+  id: string;
+  drawerId: string;
+  /** The three offered; only ever sent to the drawer. */
+  choices: DrawWord[];
+  word: string;
+  wordId: string;
+  strokes: DrawStroke[];
+  guesses: Map<string, DrawGuessRecord>;
+  chat: DrawChatLine[];
+  /** When the pick deadline expires — the server picks for them if it does. */
+  pickEndsAt: number;
+  startedAt: number;
+  durationMs: number;
+  closed: boolean;
+}
+
 interface Room {
   code: string;
   hostId: string;
@@ -173,6 +214,7 @@ interface Room {
   // beginRound/closeRound/advanceRound machinery as the others, so it's a
   // (currently single-element) list rather than a special case.
   wordRounds: WordChainRound[];
+  drawRounds: DrawRound[];
   currentRound: number;
   roundTimer?: ReturnType<typeof setTimeout>;
   // When the host is disconnected during a reveal, this timer advances the game
@@ -214,6 +256,33 @@ const WORD_CHAIN_SPEED_BONUS_MAX = 2000;
 // on the word, and it costs the same share of the game whatever the length.
 // (At four blanks that's the flat 100 this started out as.)
 const WORD_CHAIN_HINT_FRACTION = 0.2;
+
+// Draw It scoring, on the same 5000-per-round ceiling as everything else.
+//
+// A guesser gets a flat award for getting there at all plus a speed bonus, so
+// the tenth person to solve it still scores. The drawer is paid on the *share*
+// of the room that solved it, never the count — otherwise a twenty-player room
+// would pay double a ten-player one for the same drawing, and they share a
+// leaderboard.
+const DRAW_SOLVE_POINTS = 2000;
+const DRAW_SPEED_BONUS_MAX = 3000;
+const DRAW_DRAWER_MAX = 5000;
+
+// Ceilings on what one round's canvas and chat can hold. Room state lives in
+// memory and a drawing arrives from a browser, so these bound what a stuck
+// finger — or a hostile client — can make the server keep and rebroadcast.
+// Generous enough that no honest drawing comes near them.
+const MAX_STROKES_PER_ROUND = 600;
+const MAX_STROKES_PER_BATCH = 40;
+const MAX_POINTS_PER_STROKE = 400;
+const MAX_CHAT_LINES = 120;
+const MAX_GUESS_LENGTH = 60;
+
+/** Coerce an untrusted array index into range. */
+function clampIndex(value: unknown, length: number): number {
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 0 && n < length ? n : 0;
+}
 
 /** Great-circle distance between two lat/lng points, in kilometers. */
 function haversineKm(
@@ -391,6 +460,7 @@ export class RoomStore {
       rounds: [],
       geoRounds: [],
       wordRounds: [],
+      drawRounds: [],
       currentRound: 0,
       createdAt: now,
       lastActivityAt: now,
@@ -1032,6 +1102,380 @@ export class RoomStore {
   }
 
   /**
+   * Host-only. Start Draw It from the lobby.
+   *
+   * Builds the whole running order up front — who draws, in what order, with
+   * which three words — so the rotation is decided once rather than negotiated
+   * round by round, and so every drawer's words can be checked against everyone's
+   * history in a single query.
+   */
+  async startDrawItGame(
+    code: string,
+    playerId: string,
+    roundDurationSec: number,
+    hostPlaying: boolean,
+    difficulty: DrawDifficultyChoice = "any"
+  ) {
+    const room = this.requireRoom(code);
+    this.requireHost(room, playerId);
+    if (!isGameEnabled("draw_it")) {
+      throw new RoomError("Draw It isn't available right now.");
+    }
+    if (room.phase !== "lobby") {
+      throw new RoomError("You can only start a game from the lobby.");
+    }
+    const competitorNames = this.requireCompetitors(room, hostPlaying);
+    // Someone has to be guessing while someone else draws, and with two people
+    // the guesser is simply told the answer by the drawing. Three is the floor.
+    if (competitorNames.length < 3) {
+      throw new RoomError("Draw It needs at least 3 players.");
+    }
+    const duration = Number.isFinite(roundDurationSec)
+      ? Math.max(30, Math.min(300, Math.round(roundDurationSec)))
+      : DRAW_DEFAULT_DURATION_SEC;
+
+    const tier =
+      difficulty === "any"
+        ? DRAW_WORDS
+        : DRAW_WORDS.filter((w) => w.difficulty === difficulty);
+    const pool = tier.length > 0 ? tier : DRAW_WORDS;
+
+    // Prefer words none of these players have had. Unlike a chain, a repeat
+    // here only spoils it for whoever remembers it, so this stays a preference
+    // rather than a hard filter — and with three words offered per turn the
+    // bank drains three times as fast as a one-puzzle game's would.
+    const seen = await getSeenDrawCounts(competitorNames);
+    const ranked = shuffle(pool).sort(
+      (a, b) => (seen.get(a.id) ?? 0) - (seen.get(b.id) ?? 0)
+    );
+
+    const drawers = shuffle(
+      [...room.players.values()]
+        .filter((p) => hostPlaying || p.id !== room.hostId)
+        .map((p) => p.id)
+    ).slice(0, DRAW_MAX_ROUNDS);
+
+    let next = 0;
+    const rounds: DrawRound[] = drawers.map((drawerId) => {
+      const choices = ranked.slice(next, next + 3);
+      next += 3;
+      return {
+        id: nanoid(8),
+        drawerId,
+        choices,
+        word: "",
+        wordId: "",
+        strokes: [],
+        guesses: new Map<string, DrawGuessRecord>(),
+        chat: [],
+        pickEndsAt: 0,
+        startedAt: 0,
+        durationMs: duration * 1000,
+        closed: false,
+      };
+    });
+
+    room.gameType = "draw_it";
+    room.hostPlaying = hostPlaying;
+    room.settings.roundDurationSec = duration;
+    room.drawRounds = rounds;
+    room.geoRounds = [];
+    room.wordRounds = [];
+    room.rounds = [];
+    room.photos = [];
+    room.currentRound = 0;
+    for (const p of room.players.values()) {
+      p.score = 0;
+    }
+    this.beginPick(room);
+  }
+
+  /**
+   * Open the word choice for the round's drawer. The clock on the round proper
+   * doesn't start until they've picked, so a slow chooser doesn't eat the
+   * guessers' time — but the pick itself is deadlined, or a drawer who wandered
+   * off would stall the game.
+   */
+  private beginPick(room: Room) {
+    const round = room.drawRounds[room.currentRound];
+    room.phase = "picking";
+    round.pickEndsAt = Date.now() + DRAW_PICK_SECONDS * 1000;
+    if (room.roundTimer) {
+      clearTimeout(room.roundTimer);
+    }
+    if (room.autoAdvanceTimer) {
+      clearTimeout(room.autoAdvanceTimer);
+      room.autoAdvanceTimer = undefined;
+    }
+    room.roundTimer = setTimeout(() => {
+      // Out of time: take the first word for them and get on with it.
+      if (room.phase === "picking" && !round.word) {
+        this.commitWord(room, round, round.choices[0]);
+        this.onRoomChanged(room.code);
+      }
+    }, DRAW_PICK_SECONDS * 1000 + 500);
+    this.touch(room);
+  }
+
+  /** Drawer-only. Lock in one of the three offered words and start drawing. */
+  pickDrawWord(code: string, playerId: string, word: string) {
+    const room = this.requireRoom(code);
+    if (room.gameType !== "draw_it" || room.phase !== "picking") {
+      throw new RoomError("There's nothing to choose right now.");
+    }
+    const round = room.drawRounds[room.currentRound];
+    if (round.drawerId !== playerId) {
+      throw new RoomError("Only the drawer picks the word.");
+    }
+    const choice = round.choices.find((c) => c.word === word);
+    if (!choice) {
+      throw new RoomError("That isn't one of your words.");
+    }
+    this.commitWord(room, round, choice);
+  }
+
+  private commitWord(room: Room, round: DrawRound, choice: DrawWord) {
+    round.word = choice.word;
+    round.wordId = choice.id;
+    room.phase = "playing";
+    round.startedAt = Date.now();
+    round.closed = false;
+    if (room.roundTimer) {
+      clearTimeout(room.roundTimer);
+    }
+    room.roundTimer = setTimeout(() => {
+      this.closeRound(room);
+      this.onRoomChanged(room.code);
+    }, round.durationMs + 500);
+    this.touch(room);
+  }
+
+  /**
+   * The round in play, if the caller is its drawer and there is still time.
+   *
+   * Returns null rather than throwing when the round has moved on, because a
+   * stroke landing just after the last guesser solves it is ordinary — the
+   * drawer's hand was already moving. Only drawing when you aren't the drawer
+   * is an actual error worth telling someone about.
+   */
+  private liveDrawRound(code: string, playerId: string) {
+    const room = this.getRoom(code);
+    if (!room || room.gameType !== "draw_it") {
+      return null;
+    }
+    const round = room.drawRounds[room.currentRound];
+    if (!round) {
+      return null;
+    }
+    if (round.drawerId !== playerId) {
+      throw new RoomError("You're not the one drawing.");
+    }
+    if (room.phase !== "playing" || round.closed) {
+      return null;
+    }
+    return { room, round };
+  }
+
+  /**
+   * Append finished strokes to the canvas.
+   *
+   * Sanitised rather than trusted: a stroke arrives from a browser, and the
+   * server is what every other client renders from. Bad indices, odd-length
+   * point lists and out-of-range coordinates are all fixable here and all
+   * unfixable once they've been broadcast.
+   */
+  appendDrawStrokes(code: string, playerId: string, strokes: DrawStroke[]) {
+    const live = this.liveDrawRound(code, playerId);
+    if (!live || !Array.isArray(strokes)) {
+      return;
+    }
+    const { room, round } = live;
+    for (const stroke of strokes.slice(0, MAX_STROKES_PER_BATCH)) {
+      const points = Array.isArray(stroke?.points) ? stroke.points : [];
+      // Pairs only, and long enough to be a mark rather than a stray tap.
+      const usable = points.length - (points.length % 2);
+      if (usable < 2) {
+        continue;
+      }
+      if (round.strokes.length >= MAX_STROKES_PER_ROUND) {
+        break;
+      }
+      round.strokes.push({
+        // Client-chosen and only ever compared to its neighbours, so a junk id
+        // can group a stroke oddly for whoever sent it and nothing more.
+        id: String(stroke?.id ?? "").slice(0, 12) || nanoid(6),
+        color: clampIndex(stroke.color, DRAW_COLORS.length),
+        width: clampIndex(stroke.width, DRAW_WIDTHS.length),
+        points: points
+          .slice(0, Math.min(usable, MAX_POINTS_PER_STROKE * 2))
+          .map((n) =>
+            Number.isFinite(n)
+              ? Math.max(0, Math.min(DRAW_CANVAS_UNITS, Math.round(n)))
+              : 0
+          ),
+      });
+    }
+    this.touch(room);
+  }
+
+  /** Drawer-only. Drop the last stroke, or wipe the canvas. */
+  editDrawCanvas(code: string, playerId: string, action: "undo" | "clear") {
+    const live = this.liveDrawRound(code, playerId);
+    if (!live) {
+      return this.drawStrokes(code);
+    }
+    const { room, round } = live;
+    if (action === "clear") {
+      round.strokes = [];
+    } else {
+      // Undo takes back a pen-down, not a fragment of one: drop every trailing
+      // segment that shares the last one's id.
+      const last = round.strokes[round.strokes.length - 1];
+      if (last) {
+        while (
+          round.strokes.length > 0 &&
+          round.strokes[round.strokes.length - 1].id === last.id
+        ) {
+          round.strokes.pop();
+        }
+      }
+    }
+    this.touch(room);
+    return round.strokes;
+  }
+
+  /**
+   * Submit a guess.
+   *
+   * Returns whether it was right and what it earned. The word is never in the
+   * return value, and a correct guess produces a chat line with empty text —
+   * everything that leaves this method is safe to show the whole room.
+   */
+  submitDrawGuess(
+    code: string,
+    playerId: string,
+    text: string
+  ): { result: DrawGuessResult; line: DrawChatLine | null } {
+    const room = this.requireRoom(code);
+    if (room.gameType !== "draw_it" || room.phase !== "playing") {
+      throw new RoomError("There's nothing to guess right now.");
+    }
+    if (!room.players.has(playerId)) {
+      throw new RoomError("You are not in this room.");
+    }
+    const round = room.drawRounds[room.currentRound];
+    if (round.drawerId === playerId) {
+      throw new RoomError("You're drawing this one!");
+    }
+    if (this.isSpectator(room, playerId)) {
+      throw new RoomError("You're spectating this game — sit back and watch!");
+    }
+    if (round.guesses.get(playerId)?.correct) {
+      return { result: { correct: false, points: 0 }, line: null };
+    }
+
+    const clean = text.trim().slice(0, MAX_GUESS_LENGTH);
+    if (!clean) {
+      return { result: { correct: false, points: 0 }, line: null };
+    }
+
+    if (normalizeGuess(clean) !== normalizeGuess(round.word)) {
+      const line: DrawChatLine = {
+        id: nanoid(6),
+        playerId,
+        text: clean,
+        solved: false,
+      };
+      round.chat.push(line);
+      if (round.chat.length > MAX_CHAT_LINES) {
+        round.chat.shift();
+      }
+      this.touch(room);
+      return { result: { correct: false, points: 0 }, line };
+    }
+
+    const elapsed = Date.now() - round.startedAt;
+    const remaining = Math.max(0, 1 - elapsed / round.durationMs);
+    const points = DRAW_SOLVE_POINTS + Math.round(DRAW_SPEED_BONUS_MAX * remaining);
+    round.guesses.set(playerId, { correct: true, timeMs: elapsed, points });
+
+    // The word is deliberately absent — this line goes to everyone.
+    const line: DrawChatLine = {
+      id: nanoid(6),
+      playerId,
+      text: "",
+      solved: true,
+    };
+    round.chat.push(line);
+    if (round.chat.length > MAX_CHAT_LINES) {
+      round.chat.shift();
+    }
+
+    if (this.allConnectedSolved(room, round)) {
+      this.closeRound(room);
+    }
+    this.touch(room);
+    return { result: { correct: true, points }, line };
+  }
+
+  /** Everyone who could guess, has. */
+  private allConnectedSolved(room: Room, round: DrawRound): boolean {
+    const guessers = [...room.players.values()].filter(
+      (p) =>
+        p.connected &&
+        p.id !== round.drawerId &&
+        !this.isSpectator(room, p.id)
+    );
+    return (
+      guessers.length > 0 &&
+      guessers.every((p) => round.guesses.get(p.id)?.correct)
+    );
+  }
+
+  /** Everyone in the room who is guessing this round. */
+  private drawGuesserIds(room: Room, round: DrawRound): string[] {
+    return [...room.players.keys()].filter(
+      (id) => id !== round.drawerId && !this.isSpectator(room, id)
+    );
+  }
+
+  /** What the drawer earned: the ceiling, scaled by the share who solved it. */
+  private drawerPoints(room: Room, round: DrawRound): number {
+    const guessers = this.drawGuesserIds(room, round);
+    if (guessers.length === 0) {
+      return 0;
+    }
+    const solved = guessers.filter(
+      (id) => round.guesses.get(id)?.correct
+    ).length;
+    return Math.round(DRAW_DRAWER_MAX * (solved / guessers.length));
+  }
+
+  /** How many guessers have it — the counter the chat header shows. */
+  drawSolvedCount(code: string): number {
+    const room = this.getRoom(code);
+    if (!room || room.gameType !== "draw_it") {
+      return 0;
+    }
+    const round = room.drawRounds[room.currentRound];
+    if (!round) {
+      return 0;
+    }
+    return this.drawGuesserIds(room, round).filter(
+      (id) => round.guesses.get(id)?.correct
+    ).length;
+  }
+
+  /** The canvas as the server holds it, for the undo/clear rebroadcast. */
+  drawStrokes(code: string): DrawStroke[] {
+    const room = this.getRoom(code);
+    if (!room || room.gameType !== "draw_it") {
+      return [];
+    }
+    return room.drawRounds[room.currentRound]?.strokes ?? [];
+  }
+
+  /**
    * True when at least one connected competitor exists and all of them have
    * submitted a guess for `round`. Used to decide when a round can close early.
    * Works for both geo and photo rounds (both key `guesses` by playerId).
@@ -1057,7 +1501,25 @@ export class RoomStore {
     if (!room) {
       return;
     }
-    if (room.phase === "playing" && room.gameType === "word_chain") {
+    if (room.gameType === "draw_it" && room.phase === "picking") {
+      // Nobody to choose. Take the first word so the room isn't stuck behind
+      // someone who has gone.
+      const round = room.drawRounds[room.currentRound];
+      if (round && !round.word && !room.players.get(round.drawerId)?.connected) {
+        this.commitWord(room, round, round.choices[0]);
+      }
+    } else if (room.gameType === "draw_it" && room.phase === "playing") {
+      const round = room.drawRounds[room.currentRound];
+      if (round && !round.closed) {
+        // The drawer leaving ends the round — there is nothing left to guess
+        // from. Whoever already solved it keeps what they earned.
+        if (!room.players.get(round.drawerId)?.connected) {
+          this.closeRound(room);
+        } else if (this.allConnectedSolved(room, round)) {
+          this.closeRound(room);
+        }
+      }
+    } else if (room.phase === "playing" && room.gameType === "word_chain") {
       const round = room.wordRounds[room.currentRound];
       if (round && !round.closed && this.allConnectedFinished(room, round)) {
         this.closeRound(room);
@@ -1110,12 +1572,16 @@ export class RoomStore {
    * round shapes carry the same clock fields, which is what lets `beginRound`
    * and the sweep stay game-agnostic.
    */
-  private activeRound(room: Room): InternalRound | GeoRound | WordChainRound {
+  private activeRound(
+    room: Room
+  ): InternalRound | GeoRound | WordChainRound | DrawRound {
     switch (room.gameType) {
       case "geo_guessr":
         return room.geoRounds[room.currentRound];
       case "word_chain":
         return room.wordRounds[room.currentRound];
+      case "draw_it":
+        return room.drawRounds[room.currentRound];
       default:
         return room.rounds[room.currentRound];
     }
@@ -1128,6 +1594,8 @@ export class RoomStore {
         return room.geoRounds.length;
       case "word_chain":
         return room.wordRounds.length;
+      case "draw_it":
+        return room.drawRounds.length;
       default:
         return room.rounds.length;
     }
@@ -1194,6 +1662,31 @@ export class RoomStore {
   }
 
   private closeRound(room: Room) {
+    if (room.gameType === "draw_it") {
+      const round = room.drawRounds[room.currentRound];
+      if (!round || round.closed) {
+        return;
+      }
+      round.closed = true;
+      if (room.roundTimer) {
+        clearTimeout(room.roundTimer);
+        room.roundTimer = undefined;
+      }
+      for (const [playerId, guess] of round.guesses) {
+        const player = room.players.get(playerId);
+        if (player && guess.correct) {
+          player.score += guess.points;
+        }
+      }
+      const drawer = room.players.get(round.drawerId);
+      if (drawer) {
+        drawer.score += this.drawerPoints(room, round);
+      }
+      room.phase = "reveal";
+      this.maybeScheduleHostAbsentAdvance(room);
+      return;
+    }
+
     if (room.gameType === "word_chain") {
       const round = room.wordRounds[room.currentRound];
       if (!round || round.closed) {
@@ -1281,6 +1774,12 @@ export class RoomStore {
       return;
     }
     room.currentRound += 1;
+    // Draw It's round opens on a word choice rather than a running clock, so it
+    // enters through its own door.
+    if (room.gameType === "draw_it") {
+      this.beginPick(room);
+      return;
+    }
     this.beginRound(room);
   }
 
@@ -1300,6 +1799,7 @@ export class RoomStore {
     room.rounds = [];
     room.geoRounds = [];
     room.wordRounds = [];
+    room.drawRounds = [];
     room.currentRound = 0;
     room.persisted = false;
     room.hostPlaying = false;
@@ -1346,6 +1846,34 @@ export class RoomStore {
       wordPuzzleIds:
         room.gameType === "word_chain"
           ? room.wordRounds.map((r) => r.puzzleId)
+          : undefined,
+      // Only words that actually got drawn — a round abandoned before the pick
+      // shouldn't burn a word out of everyone's future.
+      drawWordIds:
+        room.gameType === "draw_it"
+          ? room.drawRounds.map((r) => r.wordId).filter(Boolean)
+          : undefined,
+      // Only rounds that produced something. A drawer who left before picking,
+      // or picked and never drew, has nothing worth keeping.
+      drawings:
+        room.gameType === "draw_it"
+          ? room.drawRounds
+              .filter((r) => r.word && r.strokes.length > 0)
+              .map((r) => {
+                const drawer = room.players.get(r.drawerId);
+                const guessers = this.drawGuesserIds(room, r);
+                return {
+                  word: r.word,
+                  drawerName: drawer?.name ?? "Someone",
+                  drawerColor: drawer?.color ?? "#a78bfa",
+                  score: this.drawerPoints(room, r),
+                  solved: guessers.filter(
+                    (id) => r.guesses.get(id)?.correct
+                  ).length,
+                  guessers: guessers.length,
+                  strokes: r.strokes,
+                };
+              })
           : undefined,
     };
   }
@@ -1444,6 +1972,71 @@ export class RoomStore {
       players,
       settings: room.settings,
     };
+
+    if (room.gameType === "draw_it") {
+      const round = room.drawRounds[room.currentRound];
+
+      if (round && (room.phase === "picking" || room.phase === "playing")) {
+        const iAmDrawer = viewerId === round.drawerId;
+        const guessers = this.drawGuesserIds(room, round);
+        state.drawRound = {
+          index: room.currentRound,
+          total: room.drawRounds.length,
+          drawerId: round.drawerId,
+          iAmDrawer,
+          // The two fields that carry the whole game's secret. `word` goes to
+          // exactly one person; everyone else gets the shape of it.
+          word: iAmDrawer ? round.word || undefined : undefined,
+          wordMask: round.word ? maskWord(round.word) : "",
+          wordChoices:
+            iAmDrawer && room.phase === "picking"
+              ? round.choices.map((c) => c.word)
+              : undefined,
+          endsAt:
+            room.phase === "picking"
+              ? round.pickEndsAt
+              : round.startedAt + round.durationMs,
+          strokes: round.strokes,
+          chat: round.chat,
+          iGuessed: round.guesses.get(viewerId)?.correct ?? false,
+          solvedCount: guessers.filter(
+            (id) => round.guesses.get(id)?.correct
+          ).length,
+          guessCount: guessers.length,
+          myPoints: round.guesses.get(viewerId)?.points ?? 0,
+          spectating: this.isSpectator(room, viewerId),
+          isHost: viewerId === room.hostId,
+        };
+      }
+
+      if (round && room.phase === "reveal") {
+        state.drawReveal = {
+          index: room.currentRound,
+          total: room.drawRounds.length,
+          drawerId: round.drawerId,
+          word: round.word,
+          strokes: round.strokes,
+          results: this.drawGuesserIds(room, round)
+            .map((id) => {
+              const g = round.guesses.get(id);
+              return {
+                playerId: id,
+                correct: g?.correct ?? false,
+                timeMs: g?.correct ? g.timeMs : null,
+                points: g?.correct ? g.points : 0,
+              };
+            })
+            .sort((a, b) => b.points - a.points),
+          drawerPoints: this.drawerPoints(room, round),
+        };
+      }
+
+      if (room.phase === "final") {
+        state.final = { ranking: this.finalRanking(room) };
+      }
+
+      return state;
+    }
 
     if (room.gameType === "word_chain") {
       const competitorIds = [...room.players.keys()].filter(

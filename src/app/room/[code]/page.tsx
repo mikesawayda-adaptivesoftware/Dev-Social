@@ -13,6 +13,8 @@ import { GeoPlaying } from "@/components/game/geo/GeoPlaying";
 import { GeoReveal } from "@/components/game/geo/GeoReveal";
 import { WordChainPlaying } from "@/components/game/word/WordChainPlaying";
 import { WordChainReveal } from "@/components/game/word/WordChainReveal";
+import { DrawItPlaying } from "@/components/game/draw/DrawItPlaying";
+import { DrawItReveal } from "@/components/game/draw/DrawItReveal";
 
 export default function RoomPage() {
   const params = useParams();
@@ -118,6 +120,16 @@ export default function RoomPage() {
           <>
             {state.phase === "playing" && <WordChainPlaying />}
             {state.phase === "reveal" && <WordChainReveal />}
+          </>
+        )}
+        {state.gameType === "draw_it" && (
+          <>
+            {/* Picking and playing are one screen — it swaps the word chooser
+                for the canvas, rather than being a different place to be. */}
+            {(state.phase === "picking" || state.phase === "playing") && (
+              <DrawItPlaying />
+            )}
+            {state.phase === "reveal" && <DrawItReveal />}
           </>
         )}
         {state.gameType === "photo_guessr" && (

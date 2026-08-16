@@ -1,4 +1,5 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import type { DrawStroke } from "@/shared/types";
 
 const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const anonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
@@ -24,6 +25,22 @@ export interface SeasonRow {
 }
 
 export type TypeSeasonRow = SeasonRow & { game_type: string };
+
+/**
+ * One kept drawing. `strokes` is the same shape the game renders from, so the
+ * gallery re-draws it rather than showing a picture of it.
+ */
+export interface GalleryDrawing {
+  id: string;
+  word: string;
+  drawer_name: string;
+  drawer_color: string;
+  score: number;
+  solved: number;
+  guessers: number;
+  strokes: DrawStroke[];
+  created_at: string;
+}
 
 export interface RecentGame {
   id: string;

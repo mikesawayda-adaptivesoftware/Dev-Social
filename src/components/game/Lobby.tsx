@@ -17,6 +17,11 @@ import {
   WORD_CHAIN_DURATION_OPTIONS_SEC,
   WORD_CHAIN_LENGTH_LABELS,
   WORD_CHAIN_LENGTH_OPTIONS,
+  DRAW_DEFAULT_DURATION_SEC,
+  DRAW_DIFFICULTY_CHOICES,
+  DRAW_DURATION_OPTIONS_SEC,
+  DRAW_MAX_ROUNDS,
+  type DrawDifficultyChoice,
   type GameType,
   type WordChainDifficultyChoice,
 } from "@/shared/types";
@@ -41,6 +46,7 @@ export function Lobby() {
     startSubmission,
     startGeoGame,
     startWordChain,
+    startDrawIt,
   } = useGame();
   const origin = useSyncExternalStore(subscribeNoop, getOrigin, getServerOrigin);
   const [busy, setBusy] = useState(false);
@@ -56,6 +62,11 @@ export function Lobby() {
   const [wordLength, setWordLength] = useState<number>(
     WORD_CHAIN_DEFAULT_LENGTH
   );
+  const [drawDuration, setDrawDuration] = useState<number>(
+    DRAW_DEFAULT_DURATION_SEC
+  );
+  const [drawDifficulty, setDrawDifficulty] =
+    useState<DrawDifficultyChoice>("any");
   const [hostPlaying, setHostPlaying] = useState(false);
   const [copied, setCopied] = useState(false);
 
@@ -72,7 +83,9 @@ export function Lobby() {
   // Photo Guessr needs photos from two different people, so it really does need
   // a room. GeoGuessr and Word Chain are you against a clock, and play fine
   // alone.
-  const soloCapable = selected !== "photo_guessr";
+  // Draw It needs someone to draw *for*, so it can't be solo and it can't be
+  // two — with one guesser the drawing may as well be a direct message.
+  const soloCapable = selected === "geo_guessr" || selected === "word_chain";
   // A host by themselves can only be a player — a game with nobody competing
   // isn't a game. Derived rather than stored, so it also covers the lobby's
   // default game, which the host reaches without clicking a card at all.
@@ -81,7 +94,11 @@ export function Lobby() {
   const competitors = hostWillPlay
     ? state.players.length
     : state.players.length - 1;
-  const notEnough = soloCapable ? competitors < 1 : state.players.length < 2;
+  const notEnough = soloCapable
+    ? competitors < 1
+    : selected === "draw_it"
+      ? competitors < 3
+      : state.players.length < 2;
 
   function pickGame(gameType: GameType) {
     setError(null);
@@ -133,6 +150,8 @@ export function Lobby() {
           wordDifficulty,
           wordLength
         );
+      } else if (selected === "draw_it") {
+        await startDrawIt(drawDuration, hostWillPlay, drawDifficulty);
       } else {
         await startSubmission();
       }
@@ -310,13 +329,58 @@ export function Lobby() {
             </div>
           )}
 
+          {selected === "draw_it" && (
+            <div className="rounded-2xl border border-white/10 bg-white/5 p-4 text-left">
+              <p className="mb-2 text-sm font-semibold text-white/70">
+                Time to draw
+              </p>
+              <DurationPicker
+                options={DRAW_DURATION_OPTIONS_SEC}
+                value={drawDuration}
+                onChange={setDrawDuration}
+                format={(sec) => `${sec}s`}
+              />
+
+              <p className="mb-2 mt-4 text-sm font-semibold text-white/70">
+                Difficulty
+              </p>
+              <div className="flex gap-2">
+                {DRAW_DIFFICULTY_CHOICES.map((choice) => (
+                  <button
+                    key={choice}
+                    onClick={() => setDrawDifficulty(choice)}
+                    className={`flex-1 rounded-xl border-2 px-2 py-2 text-sm font-semibold capitalize transition-all ${
+                      drawDifficulty === choice
+                        ? "border-fuchsia-400 bg-fuchsia-400/15"
+                        : "border-white/10 bg-white/5 hover:border-white/30"
+                    }`}
+                  >
+                    {choice}
+                  </button>
+                ))}
+              </div>
+
+              <p className="mt-2 text-xs text-white/40">
+                Everyone takes a turn drawing, up to {DRAW_MAX_ROUNDS} rounds.
+                Needs at least 3 players — someone has to be guessing.
+              </p>
+              <HostPlayingToggle
+                checked={hostWillPlay}
+                onChange={setHostPlaying}
+                verb="Draw and guess"
+              />
+            </div>
+          )}
+
           <Button
             onClick={start}
             disabled={busy || notEnough}
             className="w-full max-w-sm"
           >
             {notEnough
-              ? "Waiting for players…"
+              ? selected === "draw_it"
+                ? "Need 3 players…"
+                : "Waiting for players…"
               : `Start ${GAME_TYPE_LABELS[selected]} →`}
           </Button>
           {error && (
