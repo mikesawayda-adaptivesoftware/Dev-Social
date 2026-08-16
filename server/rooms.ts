@@ -1853,6 +1853,28 @@ export class RoomStore {
         room.gameType === "draw_it"
           ? room.drawRounds.map((r) => r.wordId).filter(Boolean)
           : undefined,
+      // Only rounds that produced something. A drawer who left before picking,
+      // or picked and never drew, has nothing worth keeping.
+      drawings:
+        room.gameType === "draw_it"
+          ? room.drawRounds
+              .filter((r) => r.word && r.strokes.length > 0)
+              .map((r) => {
+                const drawer = room.players.get(r.drawerId);
+                const guessers = this.drawGuesserIds(room, r);
+                return {
+                  word: r.word,
+                  drawerName: drawer?.name ?? "Someone",
+                  drawerColor: drawer?.color ?? "#a78bfa",
+                  score: this.drawerPoints(room, r),
+                  solved: guessers.filter(
+                    (id) => r.guesses.get(id)?.correct
+                  ).length,
+                  guessers: guessers.length,
+                  strokes: r.strokes,
+                };
+              })
+          : undefined,
     };
   }
 

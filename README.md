@@ -4,7 +4,7 @@ A live, Jackbox-style party-game platform for monthly team happy hours. The host
 opens a room on the big screen, everyone joins from their phone with a 4-letter
 code, and you play together in real time.
 
-Three games ship today:
+Four games ship today:
 
 - **Photo Guessr** — everyone submits a baby photo (or any guess-worthy pic),
   then the room competes to match each photo to the right teammate. Points for
@@ -13,6 +13,10 @@ Three games ship today:
   their phone, explores, and drops a pin on a world map. You score by how close
   your pin is to the true location. Plays fine solo. (Needs a Google Maps API
   key — see [Google Maps setup](#google-maps-setup-for-real-geoguessr).)
+- **Draw It** — one person draws a secret word on their phone while everyone
+  else races to type it. Strokes stream to every screen as they happen; correct
+  guesses are announced without the word so the first solver doesn't hand it to
+  the room. The clearest drawings are kept in a gallery on the leaderboard.
 - **Word Chain** — everyone races the same clock on one seeded chain of words,
   where each neighbouring pair makes a compound word (SUN·FLOWER·BED·ROOM). Fill
   the blanks between the two ends before the timer runs out. Plays fine solo.
@@ -165,6 +169,29 @@ phones using your machine's network URL (printed by Next as `Network:`), e.g.
 > renumbering one re-deals it to players who already solved it. Dropping one is
 > safe — its rows simply stop matching anything.
 
+## How to play (Draw It)
+
+1. **Host** creates a room and, in the lobby, picks **Draw It**, the time per
+   drawing (60 / 90 / 120s) and the word difficulty.
+2. Everyone **joins** from their phone. **Three players minimum** — someone has
+   to be guessing, so this is the one game that can't be played alone.
+3. Each round one player is the drawer. They **pick one of three words**, then
+   draw it; everyone else types guesses against the clock.
+4. Wrong guesses show up in the room as chat — they're half the fun. A **correct**
+   guess is announced as *"Ada got it"* and never as the word, or the first
+   solver would hand it to everybody.
+5. Guessers score a flat award plus a **speed bonus**, so the last one in still
+   scores. The drawer scores the ceiling **scaled by the share of the room that
+   got it** — never the count, so a big room doesn't inflate the leaderboard.
+6. Everyone draws once, up to 8 rounds, then **Final** standings.
+
+> **The gallery.** Each drawing is kept and shown on the `/leaderboard`, ranked
+> by the drawer's score — which is the share of the room that guessed it, so
+> "best" means clearest rather than prettiest. What's stored is the *strokes*,
+> not an image: the gallery re-renders them through the same component the game
+> draws with, so they stay sharp at any size, need no Storage bucket or
+> rasteriser, and aren't sitting on permanent public URLs.
+
 ## Google Maps setup (for Real GeoGuessr)
 
 Real GeoGuessr renders Google Street View + an interactive map in the browser,
@@ -233,6 +260,8 @@ src/
       word/               # Word Chain: ChainBoard (tiles + race board),
                           #   WordChainPlaying, WordChainReveal,
                           #   WordChainBigScreen (the host's TV view)
+      draw/               # Draw It: DrawCanvas (renders + captures strokes),
+                          #   DrawItPlaying, DrawItReveal, DrawItBigScreen
     ui.tsx, Confetti.tsx
   lib/
     socket.ts             # Socket.IO client singleton + persisted identity
@@ -246,10 +275,12 @@ server/
   rooms.ts                # RoomStore: in-memory rooms + game state machines
   geoLocations.ts         # Curated GeoGuessr pool + panorama resolver
   wordChains.ts           # Seeded Word Chain puzzle bank (generated) + normalizing
+  drawWords.ts            # Draw It word bank (3 tiers) + guess normalizing
 scripts/
   smoke.mjs, smoke2.mjs   # End-to-end socket tests (node scripts/smoke.mjs)
   smokeGeo.mjs            # GeoGuessr socket flow test
   smokeWordChain.mjs      # Word Chain socket flow test
+  smokeDrawIt.mjs         # Draw It socket flow test (asserts the word can't leak)
   generateWordChains.mjs  # Walk the vetted link graph to grow the puzzle bank
   resolvePanos.ts         # Bake Street View panorama ids into the pool
 ```
@@ -341,10 +372,12 @@ The schema was created via migrations (`games`, `game_players`,
 > `..._leaderboard_views` is applied the `/leaderboard` page errors on the
 > missing `season_leaderboard_by_type` view; until `..._players_identity` is
 > applied, hosting/joining a Supabase-backed server fails on the missing
-> `players` table. The two history tables are optional —
-> `..._player_locations_seen` and `..._player_word_chains_seen` silently no-op
-> when absent, they just stop steering games away from content a player has
-> already had.
+> `players` table. The rest degrade quietly rather than breaking. The three
+> history tables (`..._player_locations_seen`, `..._player_word_chains_seen`,
+> `..._player_draw_words_seen`) silently no-op when absent — games just stop
+> steering away from content a player has already had. Without
+> `..._game_drawings`, Draw It plays normally and the leaderboard gallery is
+> simply empty.
 
 ### Going fully Supabase-native (optional, later)
 
@@ -660,6 +693,7 @@ server {
 | `node scripts/smoke2.mjs` | Deterministic scoring test              |
 | `node scripts/smokeGeo.mjs` | Real GeoGuessr socket flow test (skips without a Maps key) |
 | `node scripts/smokeWordChain.mjs` | Word Chain socket flow test (no keys needed) |
+| `node scripts/smokeDrawIt.mjs` | Draw It socket flow test — plays 3 rounds and asserts the word never reaches a guesser |
 | `node scripts/generateWordChains.mjs [n]` | Grow the Word Chain bank to n puzzles **per length** (default 400) |
 | `npx tsx scripts/resolvePanos.ts` | Bake Street View panorama ids into the pool |
 | `npm run lint`     | ESLint (also the first CI gate)                |

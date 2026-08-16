@@ -5,12 +5,14 @@ import { useEffect, useMemo, useState } from "react";
 import {
   supabase,
   supabaseConfigured,
+  type GalleryDrawing,
   type RecentGame,
   type SeasonRow,
   type TypeSeasonRow,
 } from "@/lib/supabaseClient";
 import { GAME_TYPE_LABELS, type GameType } from "@/shared/types";
 import { Avatar } from "@/components/ui";
+import { DrawCanvas } from "@/components/game/draw/DrawCanvas";
 
 type Tab = "overall" | GameType;
 
@@ -31,6 +33,7 @@ export default function LeaderboardPage() {
   const [season, setSeason] = useState<SeasonRow[] | null>(null);
   const [byType, setByType] = useState<TypeSeasonRow[] | null>(null);
   const [recent, setRecent] = useState<RecentGame[] | null>(null);
+  const [drawings, setDrawings] = useState<GalleryDrawing[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   // Start "loading" only when Supabase is configured; otherwise there is
   // nothing to fetch, so the page renders its unconfigured state immediately.
@@ -48,6 +51,7 @@ export default function LeaderboardPage() {
         { data: seasonData, error: seasonErr },
         { data: byTypeData, error: byTypeErr },
         { data: gamesData },
+        { data: drawingsData },
       ] = await Promise.all([
         supabase.from("season_leaderboard").select("*").limit(100),
         supabase.from("season_leaderboard_by_type").select("*").limit(200),
@@ -59,6 +63,16 @@ export default function LeaderboardPage() {
           .eq("status", "finished")
           .order("finished_at", { ascending: false })
           .limit(20),
+        // Ranked by the drawer's score, which is the share of the room that
+        // guessed it — so "best" means clearest, not prettiest.
+        supabase
+          .from("game_drawings")
+          .select(
+            "id,word,drawer_name,drawer_color,score,solved,guessers,strokes,created_at"
+          )
+          .order("score", { ascending: false })
+          .order("created_at", { ascending: false })
+          .limit(12),
       ]);
       if (!active) {
         return;
@@ -69,6 +83,9 @@ export default function LeaderboardPage() {
       setSeason((seasonData as SeasonRow[]) ?? []);
       setByType((byTypeData as TypeSeasonRow[]) ?? []);
       setRecent((gamesData as RecentGame[]) ?? []);
+      // The table may not exist yet on a project that hasn't run the migration;
+      // an empty gallery is the right outcome, not an error banner.
+      setDrawings((drawingsData as GalleryDrawing[]) ?? []);
       setLoading(false);
     })();
     return () => {
@@ -217,6 +234,41 @@ export default function LeaderboardPage() {
             </div>
           )}
         </>
+      )}
+
+      {drawings && drawings.length > 0 && (
+        <section className="mt-12">
+          <h2 className="mb-1 text-sm font-bold uppercase tracking-wide text-white/60">
+            Gallery
+          </h2>
+          <p className="mb-3 text-xs text-white/40">
+            The clearest drawings — ranked by how much of the room guessed them.
+          </p>
+          <ul className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            {drawings.map((d) => (
+              <li key={d.id} className="card overflow-hidden p-2">
+                <DrawCanvas
+                  strokes={d.strokes}
+                  className="aspect-square w-full rounded-xl bg-[#0f0d1f]"
+                />
+                <div className="px-1 pb-0.5 pt-2">
+                  <p className="truncate text-sm font-bold">{d.word}</p>
+                  <p className="mt-0.5 flex items-center gap-1.5 text-xs text-white/50">
+                    <span
+                      aria-hidden
+                      className="inline-block h-2 w-2 shrink-0 rounded-full"
+                      style={{ backgroundColor: d.drawer_color }}
+                    />
+                    <span className="truncate">{d.drawer_name}</span>
+                    <span className="ml-auto shrink-0 font-mono">
+                      {d.guessers > 0 ? `${d.solved}/${d.guessers}` : "—"}
+                    </span>
+                  </p>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </section>
       )}
 
       {recent && recent.length > 0 && (
