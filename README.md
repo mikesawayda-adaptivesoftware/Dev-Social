@@ -88,15 +88,18 @@ phones using your machine's network URL (printed by Next as `Network:`), e.g.
 
 ## How to play (Word Chain)
 
-1. **Host** creates a room and, in the lobby, picks **Word Chain** and the time
-   limit (**1 / 2 / 5 minutes**). "I'm playing too" is on by default here.
+1. **Host** creates a room and, in the lobby, picks **Word Chain**, the time
+   limit (**1 / 2 / 5 minutes**) and the **difficulty** (Any / Easy / Normal /
+   Hard). "I'm playing too" is on by default here.
 2. Everyone **joins** from their phone with the code + their name. One player is
    fine — you're racing the clock either way (see the solo note above).
 3. Host starts → everyone gets **the same chain** at the same time: two words
    given, four blanks between them. Each neighbouring pair makes a compound word
    or set phrase, so `KEY · ? · ? · ? · ? · PUNCH` resolves to
    KEY**NOTE**, NOTE**BOOK**, BOOK**WORM**, WORM**HOLE**, HOLE PUNCH.
-4. Solve **top to bottom**. Each blank shows its length and its first letter;
+4. Solve **inwards from both ends** — there's an input at the top frontier and
+   one at the bottom, so a link you can't get stops you one way round rather
+   than stopping you dead. Each blank shows its length and its first letter;
    **💡 Reveal a letter** buys one more for −100 points. Wrong answers cost
    nothing but time.
 5. **500 points per link**, plus **1,000** for completing the chain and up to
@@ -105,6 +108,19 @@ phones using your machine's network URL (printed by Next as `Network:`), e.g.
 6. Finish early and you **wait on the others**, watching the live race board.
    The round ends when everyone finishes or the clock runs out, then **Reveal**
    shows the whole chain and everyone's times, and **Final** crowns a champion.
+
+> **On the big screen.** A host who isn't playing gets a TV layout instead of
+> the phone one: the chain large enough to read across a room, a big clock, and
+> a lane per player that fills a segment per link as they solve. It's fed by the
+> same `chain:standing` deltas the players' race board uses, and it never sees
+> an answer — the server builds it the same way it builds the view for a player
+> who has solved nothing.
+
+> **Difficulty** is how much narrowing the free first letter has to do: on an
+> easy chain the blank's length alone identifies the answer, on a hard one
+> several words fit the shape. It's measured inside the link graph, so it tracks
+> how much work the hint saves rather than how obscure the compound is. The bank
+> splits roughly evenly across the three tiers.
 
 > **No repeats, ever.** A game is a single puzzle, so a chain someone has
 > already played would hand them the whole game. The server picks from the
@@ -116,9 +132,19 @@ phones using your machine's network URL (printed by Next as `Network:`), e.g.
 > The bank ships **500 chains**. To grow it, add links to the `LINKS` table in
 > `scripts/generateWordChains.mjs` and re-run it — the chains are walked out of
 > that graph, so a link that isn't a real compound is the one bug that matters
-> here and the table is the only thing worth reviewing. Existing chains and
-> their ids are always kept; the history table is keyed by id, so renumbering
-> one re-deals it to players who already solved it.
+> here and the table is the only thing worth reviewing.
+>
+> **Every blank has exactly one answer**, checked from both directions, and the
+> generator drops chains that break that rule — including ones already in the
+> bank. This is the constraint to keep in mind when adding links: a new link can
+> retroactively give an old blank a second answer (add `BED → ROCK` and the
+> blank in `BED · ? · SERVICE` accepts both ROOM and ROCK), so growing the graph
+> can shrink the bank. That's the right trade. A puzzle that tells a correct
+> player they're wrong, mid-race, is worse than one fewer puzzle.
+>
+> Ids of surviving chains are always kept; the history table is keyed by id, so
+> renumbering one re-deals it to players who already solved it. Dropping one is
+> safe — its rows simply stop matching anything.
 
 ## Google Maps setup (for Real GeoGuessr)
 
@@ -186,7 +212,8 @@ src/
       geo/                # Real GeoGuessr: StreetViewPano, GuessMap,
                           #   GeoPlaying, GeoReveal
       word/               # Word Chain: ChainBoard (tiles + race board),
-                          #   WordChainPlaying, WordChainReveal
+                          #   WordChainPlaying, WordChainReveal,
+                          #   WordChainBigScreen (the host's TV view)
     ui.tsx, Confetti.tsx
   lib/
     socket.ts             # Socket.IO client singleton + persisted identity

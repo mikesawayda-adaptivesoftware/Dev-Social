@@ -20,8 +20,10 @@ const BANK = "server/wordChains.ts";
 const loadPuzzles = () => {
   const src = readFileSync(new URL(`../${BANK}`, import.meta.url), "utf8");
   const puzzles = new Map();
+  // Tolerates fields after the word list (difficulty, and whatever comes next)
+  // so a new column in the bank doesn't quietly make this test parse nothing.
   for (const [, id, list] of src.matchAll(
-    /\{\s*id:\s*"([^"]+)",\s*words:\s*\[([^\]]+)\]\s*\}/g
+    /\{\s*id:\s*"([^"]+)",\s*words:\s*\[([^\]]+)\][^}]*\}/g
   )) {
     puzzles.set(
       id,
@@ -56,10 +58,40 @@ const assert = (cond, message) => {
   }
 };
 
+/** The host's difficulty choice must actually decide which chain is dealt. */
+const checkDifficultyFilter = async (tier) => {
+  const sock = await connect();
+  const dealt = new Promise((resolve) => {
+    sock.on("room:state", (state) => {
+      if (state.wordRound) {
+        resolve(state.wordRound.difficulty);
+      }
+    });
+  });
+  await emit(sock, "room:create", {
+    name: `Solo${tier}`,
+    pin: "7777",
+    visibility: "private",
+  });
+  await emit(sock, "host:startWordChain", {
+    durationSec: 60,
+    hostPlaying: true,
+    difficulty: tier,
+  });
+  const got = await dealt;
+  assert(got === tier, `asked for a ${tier} chain, was dealt a ${got} one`);
+  console.log(`  difficulty "${tier}" honoured`);
+  sock.close();
+};
+
 const main = async () => {
   const puzzles = loadPuzzles();
   assert(puzzles.size > 0, `no puzzles parsed out of ${BANK}`);
   console.log(`loaded ${puzzles.size} puzzles`);
+
+  for (const tier of ["easy", "normal", "hard"]) {
+    await checkDifficultyFilter(tier);
+  }
 
   const [a, b, c] = await Promise.all([connect(), connect(), connect()]);
 
@@ -71,27 +103,36 @@ const main = async () => {
   const solver = (
     sock,
     name,
-    { hintFirst = false, missFirst = false, slowMs = 0 } = {}
+    { hintFirst = false, missFirst = false, slowMs = 0, fromBack = false } = {}
   ) => {
     let hinted = false;
     let missed = false;
-    // Highest blank already answered. A hint also earns a snapshot, so without
-    // this the handler could re-enter on a stale view and answer a blank twice.
-    let lastSent = -1;
+    // Blanks already answered. A hint also earns a snapshot, so without this
+    // the handler could re-enter on a stale view and answer one twice.
+    const answered = new Set();
     sock.on("room:state", async (state) => {
       const word = state.wordRound;
       if (state.phase !== "playing" || !word || word.finished) {
         return;
       }
-      if (word.activeIndex <= lastSent) {
+      // Answer the far end when asked to, so the run exercises solving upward
+      // from the last word as well as downward from the first.
+      const index = fromBack
+        ? word.activeIndexes[word.activeIndexes.length - 1]
+        : word.activeIndexes[0];
+      if (index === undefined || answered.has(index)) {
         return;
       }
-      lastSent = word.activeIndex;
+      answered.add(index);
       const answers = puzzles.get(word.puzzleId);
       assert(answers, `server dealt unknown puzzle ${word.puzzleId}`);
       assert(
         word.blanks.length === answers.length - 2,
         `expected ${answers.length - 2} blanks, got ${word.blanks.length}`
+      );
+      assert(
+        word.activeIndexes.length >= 1 && word.activeIndexes.length <= 2,
+        `expected 1 or 2 open blanks, got ${word.activeIndexes.length}`
       );
       // The answers must not be reachable from the client's own view.
       for (const [i, blank] of word.blanks.entries()) {
@@ -103,20 +144,20 @@ const main = async () => {
         }
       }
 
+      const solvedBefore = word.blanks.filter((b) => b.solvedWord).length;
+
       if (missFirst && !missed) {
         missed = true;
-        const res = await emit(sock, "word:guess", {
-          index: word.activeIndex,
-          guess: "NOTAWORD",
-        });
+        const res = await emit(sock, "word:guess", { index, guess: "NOTAWORD" });
         assert(!res.correct, "a wrong answer was accepted");
-        assert(res.solved === word.activeIndex, "a wrong answer scored a link");
+        assert(res.solved === solvedBefore, "a wrong answer scored a link");
         console.log(`  ${name}: wrong answer correctly rejected`);
       }
       if (hintFirst && !hinted) {
         hinted = true;
-        const hint = await emit(sock, "word:hint");
-        const answer = answers[word.activeIndex + 1];
+        const hint = await emit(sock, "word:hint", { index });
+        const answer = answers[index + 1];
+        assert(hint.index === index, "hint came back for the wrong blank");
         assert(
           answer.startsWith(hint.revealed),
           `hint "${hint.revealed}" doesn't prefix ${answer}`
@@ -132,17 +173,18 @@ const main = async () => {
         await sleep(slowMs);
       }
       const res = await emit(sock, "word:guess", {
-        index: word.activeIndex,
-        guess: answers[word.activeIndex + 1].toLowerCase(), // case shouldn't matter
+        index,
+        guess: answers[index + 1].toLowerCase(), // case shouldn't matter
       });
       assert(res.correct, `correct answer rejected for ${name}`);
     });
   };
 
-  // Bob races ahead; Cara dawdles. That gap is the point — it's what puts Bob
-  // in the "finished, waiting on everyone else" state the game is built around.
+  // Bob races ahead from the top; Cara dawdles and works up from the bottom, so
+  // one run covers both directions. The gap between them is the point too —
+  // it's what puts Bob in the "finished, waiting on everyone else" state.
   solver(b, "Bob", { hintFirst: true });
-  solver(c, "Cara", { missFirst: true, slowMs: 350 });
+  solver(c, "Cara", { missFirst: true, slowMs: 350, fromBack: true });
 
   // Bob should sit in a finished-but-still-playing state rather than the round
   // ending under Cara.
@@ -187,7 +229,11 @@ const main = async () => {
     setTimeout(() => reject(new Error("timed out waiting for final")), 30_000);
   });
 
-  await emit(a, "host:startWordChain", { durationSec: 60, hostPlaying: false });
+  await emit(a, "host:startWordChain", {
+    durationSec: 60,
+    hostPlaying: false,
+    difficulty: "any",
+  });
   console.log("word chain started");
 
   const finalState = await done;

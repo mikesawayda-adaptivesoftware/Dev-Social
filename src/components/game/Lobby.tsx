@@ -11,8 +11,11 @@ import {
   GEO_DEFAULT_DURATION_SEC,
   GEO_DURATION_OPTIONS_SEC,
   WORD_CHAIN_DEFAULT_DURATION_SEC,
+  WORD_CHAIN_DIFFICULTY_CHOICES,
+  WORD_CHAIN_DIFFICULTY_LABELS,
   WORD_CHAIN_DURATION_OPTIONS_SEC,
   type GameType,
+  type WordChainDifficultyChoice,
 } from "@/shared/types";
 import { PlayerList, RoomCodeBadge } from "./shared";
 
@@ -45,6 +48,8 @@ export function Lobby() {
   const [wordDuration, setWordDuration] = useState<number>(
     WORD_CHAIN_DEFAULT_DURATION_SEC
   );
+  const [wordDifficulty, setWordDifficulty] =
+    useState<WordChainDifficultyChoice>("any");
   const [hostPlaying, setHostPlaying] = useState(false);
   const [copied, setCopied] = useState(false);
 
@@ -116,7 +121,7 @@ export function Lobby() {
       if (selected === "geo_guessr") {
         await startGeoGame(geoDuration, hostWillPlay);
       } else if (selected === "word_chain") {
-        await startWordChain(wordDuration, hostWillPlay);
+        await startWordChain(wordDuration, hostWillPlay, wordDifficulty);
       } else {
         await startSubmission();
       }
@@ -228,9 +233,30 @@ export function Lobby() {
                 onChange={setWordDuration}
                 format={(sec) => `${sec / 60} min`}
               />
+              <p className="mb-2 mt-4 text-sm font-semibold text-white/70">
+                Difficulty
+              </p>
+              <div className="flex gap-2">
+                {WORD_CHAIN_DIFFICULTY_CHOICES.map((choice) => (
+                  <button
+                    key={choice}
+                    onClick={() => setWordDifficulty(choice)}
+                    className={`flex-1 rounded-xl border-2 px-2 py-2 text-sm font-semibold transition-all ${
+                      wordDifficulty === choice
+                        ? "border-fuchsia-400 bg-fuchsia-400/15"
+                        : "border-white/10 bg-white/5 hover:border-white/30"
+                    }`}
+                  >
+                    {WORD_CHAIN_DIFFICULTY_LABELS[choice]}
+                  </button>
+                ))}
+              </div>
+
               <p className="mt-2 text-xs text-white/40">
-                One puzzle, everyone racing the same clock. Nobody is dealt a
-                chain they&apos;ve played before.
+                One puzzle, everyone racing the same clock, solving in from both
+                ends. Nobody is dealt a chain they&apos;ve played before.
+                Difficulty is how many words fit each blank before the first
+                letter narrows it down.
               </p>
               <HostPlayingToggle
                 checked={hostWillPlay}
