@@ -84,11 +84,15 @@ body {
 
 @keyframes confetti-fall {
   0% {
-    transform: translateY(-10vh) rotate(0deg);
+    /* Clear of the top edge by its own height as well as the 10vh, so a piece
+       is fully out of frame before it starts rather than half-showing. */
+    transform: translateY(calc(-10vh - 100%))
+      rotate(var(--confetti-spin, 0deg));
     opacity: 1;
   }
   100% {
-    transform: translateY(110vh) rotate(720deg);
+    transform: translateY(110vh)
+      rotate(calc(var(--confetti-spin, 0deg) + 720deg));
     opacity: 0.9;
   }
 }
@@ -98,7 +102,12 @@ body {
   width: 10px;
   height: 16px;
   border-radius: 2px;
-  animation: confetti-fall linear forwards;
+  /* `both`, not `forwards`. A fill mode of `forwards` only covers the *end* of
+     the animation, so during its `animation-delay` a piece renders at its
+     static position — parked in a row along the top edge, in plain sight,
+     until its turn. `backwards` is the half that fixes that; `both` keeps the
+     settled end state too. */
+  animation: confetti-fall linear both;
   z-index: 50;
   pointer-events: none;
 }
