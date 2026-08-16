@@ -327,6 +327,16 @@ export const DRAW_DEFAULT_DURATION_SEC = 90;
 export const DRAW_MAX_ROUNDS = 8;
 
 export interface DrawStroke {
+  /**
+   * Which pen-down this segment belongs to.
+   *
+   * A long stroke is sent in pieces while it's still being drawn — otherwise
+   * guessers see nothing until the pen lifts, which on a slow outline is
+   * several seconds of blank canvas in a timed race. Consecutive segments share
+   * an id so that undo removes the whole stroke rather than the last fragment
+   * of it.
+   */
+  id: string;
   /** Index into DRAW_COLORS. */
   color: number;
   /** Index into DRAW_WIDTHS. */

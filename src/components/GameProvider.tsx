@@ -20,6 +20,10 @@ import {
 } from "@/lib/socket";
 import type {
   AckResult,
+  DrawChatLine,
+  DrawDifficultyChoice,
+  DrawGuessResult,
+  DrawStroke,
   GameType,
   PublicPlayer,
   RoomState,
@@ -77,6 +81,16 @@ interface GameContextValue {
   revealWordHint: (
     index: number
   ) => Promise<{ index: number; revealed: string; hintsUsed: number }>;
+  startDrawIt: (
+    roundDurationSec: number,
+    hostPlaying: boolean,
+    difficulty: DrawDifficultyChoice
+  ) => Promise<void>;
+  pickDrawWord: (word: string) => Promise<void>;
+  sendDrawStroke: (stroke: DrawStroke) => void;
+  undoDrawStroke: () => Promise<void>;
+  clearDrawCanvas: () => Promise<void>;
+  submitDrawGuess: (text: string) => Promise<DrawGuessResult>;
   nextRound: () => Promise<void>;
   playAgain: () => Promise<void>;
 }
@@ -137,6 +151,60 @@ function applyRoundProgress(
     return { ...state, round: { ...state.round, answeredCount } };
   }
   return state;
+}
+
+/**
+ * New strokes, appended to whatever we already hold. The prefix is left as the
+ * same array contents so the canvas keeps agreeing with the room even while a
+ * snapshot is in flight.
+ */
+function applyDrawInk(
+  state: RoomState | null,
+  strokes: DrawStroke[]
+): RoomState | null {
+  if (!state?.drawRound) {
+    return state;
+  }
+  return {
+    ...state,
+    drawRound: {
+      ...state.drawRound,
+      strokes: [...state.drawRound.strokes, ...strokes],
+    },
+  };
+}
+
+/** The whole canvas, after an undo or a clear. */
+function applyDrawCanvas(
+  state: RoomState | null,
+  strokes: DrawStroke[]
+): RoomState | null {
+  if (!state?.drawRound) {
+    return state;
+  }
+  return { ...state, drawRound: { ...state.drawRound, strokes } };
+}
+
+function applyDrawChat(
+  state: RoomState | null,
+  line: DrawChatLine,
+  solvedCount: number
+): RoomState | null {
+  if (!state?.drawRound) {
+    return state;
+  }
+  // Idempotent: a snapshot racing this delta must not double-add the line.
+  if (state.drawRound.chat.some((l) => l.id === line.id)) {
+    return state;
+  }
+  return {
+    ...state,
+    drawRound: {
+      ...state.drawRound,
+      chat: [...state.drawRound.chat, line],
+      solvedCount,
+    },
+  };
 }
 
 function applyChainStanding(
@@ -220,6 +288,17 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       setState((s) => applyRoundProgress(s, answeredCount));
     const onChainStanding = (standing: WordChainStanding) =>
       setState((s) => applyChainStanding(s, standing));
+    const onDrawInk = ({ strokes }: { strokes: DrawStroke[] }) =>
+      setState((s) => applyDrawInk(s, strokes));
+    const onDrawCanvas = ({ strokes }: { strokes: DrawStroke[] }) =>
+      setState((s) => applyDrawCanvas(s, strokes));
+    const onDrawChat = ({
+      line,
+      solvedCount,
+    }: {
+      line: DrawChatLine;
+      solvedCount: number;
+    }) => setState((s) => applyDrawChat(s, line, solvedCount));
 
     socket.on("connect", onConnect);
     socket.on("disconnect", onDisconnect);
@@ -228,6 +307,9 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     socket.on("room:playerConnection", onPlayerConnection);
     socket.on("round:progress", onRoundProgress);
     socket.on("chain:standing", onChainStanding);
+    socket.on("draw:ink", onDrawInk);
+    socket.on("draw:canvas", onDrawCanvas);
+    socket.on("draw:chat", onDrawChat);
     if (socket.connected) {
       onConnect();
     }
@@ -240,6 +322,9 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       socket.off("room:playerConnection", onPlayerConnection);
       socket.off("round:progress", onRoundProgress);
       socket.off("chain:standing", onChainStanding);
+      socket.off("draw:ink", onDrawInk);
+      socket.off("draw:canvas", onDrawCanvas);
+      socket.off("draw:chat", onDrawChat);
     };
   }, []);
 
@@ -547,6 +632,101 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     []
   );
 
+  const startDrawIt = useCallback(
+    (
+      roundDurationSec: number,
+      hostPlaying: boolean,
+      difficulty: DrawDifficultyChoice
+    ) =>
+      new Promise<void>((resolve, reject) => {
+        getSocket().emit(
+          "host:startDrawIt",
+          { roundDurationSec, hostPlaying, difficulty },
+          (res: AckResult<{ ok: true }>) => {
+            if (res?.ok) {
+              resolve();
+            } else {
+              reject(new Error(res?.error ?? "Couldn't start the game."));
+            }
+          }
+        );
+      }),
+    []
+  );
+
+  const pickDrawWord = useCallback(
+    (word: string) =>
+      new Promise<void>((resolve, reject) => {
+        getSocket().emit(
+          "draw:pickWord",
+          { word },
+          (res: AckResult<{ ok: true }>) => {
+            if (res?.ok) {
+              resolve();
+            } else {
+              reject(new Error(res?.error ?? "Couldn't pick that word."));
+            }
+          }
+        );
+      }),
+    []
+  );
+
+  /**
+   * Send a segment, and keep a copy.
+   *
+   * The keeping matters: the server broadcasts ink to everyone *except* the
+   * sender, so without this the drawer's own finished strokes exist on every
+   * screen but theirs — their line would vanish the moment they lifted the pen,
+   * because the canvas renders from state and the live stroke has ended.
+   *
+   * Not awaited. Segments leave several times a second, the drawer has already
+   * seen the line, and a dropped one is corrected by the next snapshot.
+   */
+  const sendDrawStroke = useCallback((stroke: DrawStroke) => {
+    getSocket().emit("draw:ink", { strokes: [stroke] });
+    setState((s) => applyDrawInk(s, [stroke]));
+  }, []);
+
+  const canvasAction = useCallback(
+    (event: "draw:undo" | "draw:clear") =>
+      new Promise<void>((resolve, reject) => {
+        const sock = getSocket() as unknown as {
+          emit: (
+            event: "draw:undo" | "draw:clear",
+            ack: (res: AckResult<{ ok: true }>) => void
+          ) => void;
+        };
+        sock.emit(event, (res) => {
+          if (res?.ok) {
+            resolve();
+          } else {
+            reject(new Error(res?.error ?? "That didn't work."));
+          }
+        });
+      }),
+    []
+  );
+
+  // Resolves for right and wrong alike — "wrong" is an answer, not an error.
+  const submitDrawGuess = useCallback(
+    (text: string) =>
+      new Promise<DrawGuessResult>((resolve, reject) => {
+        getSocket().emit(
+          "draw:guess",
+          { text },
+          (res: AckResult<DrawGuessResult>) => {
+            if (res?.ok) {
+              resolve(res);
+            } else {
+              reject(new Error(res?.error ?? "Couldn't send that guess."));
+            }
+          }
+        );
+      }),
+    []
+  );
+
   const me = useMemo(() => {
     if (!state || !identity) {
       return null;
@@ -578,6 +758,12 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     startWordChain,
     submitWordGuess,
     revealWordHint,
+    startDrawIt,
+    pickDrawWord,
+    sendDrawStroke,
+    undoDrawStroke: () => canvasAction("draw:undo"),
+    clearDrawCanvas: () => canvasAction("draw:clear"),
+    submitDrawGuess,
     nextRound: () => simpleAction("host:nextRound"),
     playAgain: () => simpleAction("host:playAgain"),
   };

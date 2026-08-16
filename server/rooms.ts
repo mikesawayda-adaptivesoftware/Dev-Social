@@ -1301,6 +1301,9 @@ export class RoomStore {
         break;
       }
       round.strokes.push({
+        // Client-chosen and only ever compared to its neighbours, so a junk id
+        // can group a stroke oddly for whoever sent it and nothing more.
+        id: String(stroke?.id ?? "").slice(0, 12) || nanoid(6),
         color: clampIndex(stroke.color, DRAW_COLORS.length),
         width: clampIndex(stroke.width, DRAW_WIDTHS.length),
         points: points
@@ -1325,7 +1328,17 @@ export class RoomStore {
     if (action === "clear") {
       round.strokes = [];
     } else {
-      round.strokes.pop();
+      // Undo takes back a pen-down, not a fragment of one: drop every trailing
+      // segment that shares the last one's id.
+      const last = round.strokes[round.strokes.length - 1];
+      if (last) {
+        while (
+          round.strokes.length > 0 &&
+          round.strokes[round.strokes.length - 1].id === last.id
+        ) {
+          round.strokes.pop();
+        }
+      }
     }
     this.touch(room);
     return round.strokes;

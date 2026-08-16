@@ -459,8 +459,10 @@ io.on("connection", (socket) => {
     try {
       const strokes = store.editDrawCanvas(code, playerId, action);
       ack?.(ok({ ok: true as const }));
-      // The whole canvas, so no client has to replay the edit to agree.
-      socket.to(code).emit("draw:canvas", { strokes });
+      // The whole canvas, so no client has to replay the edit to agree — and to
+      // the drawer as well as the room, because their copy is built optimistically
+      // from what they sent and this is what reconciles it.
+      io.to(code).emit("draw:canvas", { strokes });
     } catch (err) {
       ack?.(fail(err) as never);
     }
