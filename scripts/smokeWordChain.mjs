@@ -58,30 +58,61 @@ const assert = (cond, message) => {
   }
 };
 
-/** The host's difficulty choice must actually decide which chain is dealt. */
-const checkDifficultyFilter = async (tier) => {
+/** Start a solo game with the given options and return its first round view. */
+const dealOne = async (name, options) => {
   const sock = await connect();
   const dealt = new Promise((resolve) => {
     sock.on("room:state", (state) => {
       if (state.wordRound) {
-        resolve(state.wordRound.difficulty);
+        resolve(state.wordRound);
       }
     });
   });
-  await emit(sock, "room:create", {
-    name: `Solo${tier}`,
-    pin: "7777",
-    visibility: "private",
-  });
+  await emit(sock, "room:create", { name, pin: "7777", visibility: "private" });
   await emit(sock, "host:startWordChain", {
     durationSec: 60,
     hostPlaying: true,
-    difficulty: tier,
+    difficulty: "any",
+    length: 6,
+    ...options,
   });
-  const got = await dealt;
-  assert(got === tier, `asked for a ${tier} chain, was dealt a ${got} one`);
-  console.log(`  difficulty "${tier}" honoured`);
+  const round = await dealt;
   sock.close();
+  return round;
+};
+
+/** The host's difficulty choice must actually decide which chain is dealt. */
+const checkDifficultyFilter = async (tier) => {
+  const round = await dealOne(`Solo${tier}`, { difficulty: tier });
+  assert(
+    round.difficulty === tier,
+    `asked for a ${tier} chain, was dealt a ${round.difficulty} one`
+  );
+  console.log(`  difficulty "${tier}" honoured`);
+};
+
+/**
+ * Every length must be dealt as asked and be worth the same, or the season
+ * leaderboard would reward whoever picked the longest chain.
+ */
+const checkLength = async (words) => {
+  const round = await dealOne(`Len${words}`, { length: words });
+  const blanks = round.blanks.length;
+  assert(
+    blanks === words - 2,
+    `asked for a ${words}-word chain, got one with ${blanks} blanks`
+  );
+  // A link is worth the pot divided by however many blanks there are, so the
+  // hint (a fifth of a link) is the visible proof the split happened.
+  const expectedHint = Math.round((2000 / blanks) * 0.2);
+  assert(
+    round.hintCost === expectedHint,
+    `${words}-word chain: hint costs ${round.hintCost}, expected ${expectedHint}`
+  );
+  console.log(
+    `  length ${words} honoured — ${blanks} blanks, hint ${round.hintCost} pts`
+  );
+  return blanks;
 };
 
 const main = async () => {
@@ -92,6 +123,14 @@ const main = async () => {
   for (const tier of ["easy", "normal", "hard"]) {
     await checkDifficultyFilter(tier);
   }
+  const blankCounts = [];
+  for (const words of [5, 6, 8, 12, 17]) {
+    blankCounts.push(await checkLength(words));
+  }
+  assert(
+    new Set(blankCounts).size === blankCounts.length,
+    "the three lengths didn't produce three different blank counts"
+  );
 
   const [a, b, c] = await Promise.all([connect(), connect(), connect()]);
 
@@ -229,10 +268,13 @@ const main = async () => {
     setTimeout(() => reject(new Error("timed out waiting for final")), 30_000);
   });
 
+  // The long chain, so the full-game path runs against the most blanks and the
+  // most awkward points division rather than the tidy four-blank case.
   await emit(a, "host:startWordChain", {
     durationSec: 60,
     hostPlaying: false,
     difficulty: "any",
+    length: 8,
   });
   console.log("word chain started");
 

@@ -53,18 +53,25 @@ export function WordChainBigScreen() {
         <p className="text-xs uppercase tracking-[0.3em] text-white/40">
           Word Chain · {WORD_CHAIN_DIFFICULTY_LABELS[word.difficulty]}
         </p>
-        <div className="mt-4 flex w-full max-w-sm flex-col gap-2">
-          <BigTile text={word.startWord} given />
+        {/* Tiles shrink as the chain grows: a marathon chain is seventeen of
+            them, and a TV is only so tall. Still far larger than the phone. */}
+        <div
+          className={`mt-4 flex w-full max-w-sm flex-col ${
+            total > 8 ? "gap-1" : "gap-2"
+          }`}
+        >
+          <BigTile text={word.startWord} given size={total} />
           {word.blanks.map((blank, i) => (
             <BigTile
               key={i}
+              size={total}
               text={
                 blank.revealed +
                 "•".repeat(Math.max(0, blank.length - blank.revealed.length))
               }
             />
           ))}
-          <BigTile text={word.endWord} given />
+          <BigTile text={word.endWord} given size={total} />
         </div>
       </section>
 
@@ -104,22 +111,36 @@ export function WordChainBigScreen() {
                   {player.name}
                 </span>
                 {/* One segment per link, so progress is countable at a glance
-                    rather than a bar you have to estimate. */}
-                <span className="flex flex-1 gap-1.5">
-                  {Array.from({ length: total }, (_, i) => (
+                    rather than a bar you have to estimate — until there are so
+                    many that the segments are thinner than the gaps between
+                    them, at which point a plain bar reads better. */}
+                {total <= 10 ? (
+                  <span className="flex flex-1 gap-1.5">
+                    {Array.from({ length: total }, (_, i) => (
+                      <span
+                        key={i}
+                        className={`h-4 flex-1 rounded-full transition-colors duration-300 ${
+                          i < standing.solved ? "" : "bg-white/10"
+                        }`}
+                        style={
+                          i < standing.solved
+                            ? { backgroundColor: player.color }
+                            : undefined
+                        }
+                      />
+                    ))}
+                  </span>
+                ) : (
+                  <span className="h-4 flex-1 overflow-hidden rounded-full bg-white/10">
                     <span
-                      key={i}
-                      className={`h-4 flex-1 rounded-full transition-colors duration-300 ${
-                        i < standing.solved ? "" : "bg-white/10"
-                      }`}
-                      style={
-                        i < standing.solved
-                          ? { backgroundColor: player.color }
-                          : undefined
-                      }
+                      className="block h-full rounded-full transition-[width] duration-300"
+                      style={{
+                        width: `${(standing.solved / total) * 100}%`,
+                        backgroundColor: player.color,
+                      }}
                     />
-                  ))}
-                </span>
+                  </span>
+                )}
                 <span className="w-16 text-right font-mono text-sm font-bold">
                   {standing.finished ? (
                     <span className="text-emerald-300">done</span>
@@ -141,10 +162,27 @@ export function WordChainBigScreen() {
   );
 }
 
-function BigTile({ text, given = false }: { text: string; given?: boolean }) {
+function BigTile({
+  text,
+  given = false,
+  size,
+}: {
+  text: string;
+  given?: boolean;
+  /** Blanks in the chain — the more there are, the smaller each tile gets. */
+  size: number;
+}) {
+  // Tuned so the tallest chain still fits a 1280x800 screen without scrolling —
+  // nobody is going to scroll the TV.
+  const scale =
+    size > 12
+      ? "py-0.5 text-base sm:text-lg"
+      : size > 8
+        ? "py-1.5 text-lg sm:text-xl"
+        : "py-3 text-2xl sm:text-3xl";
   return (
     <div
-      className={`rounded-xl border-2 py-3 text-center font-mono text-2xl font-black tracking-[0.25em] sm:text-3xl ${
+      className={`rounded-xl border-2 text-center font-mono font-black tracking-[0.25em] ${scale} ${
         given
           ? "border-white/25 bg-white/10 text-white"
           : "border-dashed border-white/15 text-white/30"

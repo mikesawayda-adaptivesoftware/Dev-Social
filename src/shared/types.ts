@@ -224,6 +224,9 @@ export interface WordChainRoundView {
   /** Points banked so far, bonuses included once finished. */
   myPoints: number;
   hintsUsed: number;
+  /** What the next hint costs. Depends on the chain's length, so the server
+   * works it out rather than the UI re-deriving the scoring rules. */
+  hintCost: number;
   /** Everyone's progress, including this viewer's, for the live race board. */
   standings: WordChainStanding[];
   spectating: boolean; // true if this client watches instead of solving
@@ -312,6 +315,26 @@ export const WORD_CHAIN_DURATION_OPTIONS_SEC = [60, 120, 300] as const;
 export const WORD_CHAIN_DEFAULT_DURATION_SEC = 120;
 
 /**
+ * Chain lengths the host can pick, in words. Two of every chain are given, so
+ * these are 3, 4, 6, 10 and 15 blanks to fill.
+ *
+ * Every length is worth the same 5,000 — the solve points are a fixed pot split
+ * across the blanks — so this changes how the puzzle feels, not what it pays.
+ * Must stay in step with CHAIN_LENGTHS in scripts/generateWordChains.mjs, which
+ * is what decides the lengths the bank actually contains.
+ */
+export const WORD_CHAIN_LENGTH_OPTIONS = [5, 6, 8, 12, 17] as const;
+export const WORD_CHAIN_DEFAULT_LENGTH = 6;
+
+export const WORD_CHAIN_LENGTH_LABELS: Record<number, string> = {
+  5: "Short",
+  6: "Standard",
+  8: "Long",
+  12: "Epic",
+  17: "Marathon",
+};
+
+/**
  * Hard cap on players in one room. A real decision now — it used to be an
  * accident of how many colors were in the avatar palette.
  */
@@ -376,6 +399,8 @@ export interface ClientToServerEvents {
       durationSec: number;
       hostPlaying: boolean;
       difficulty: WordChainDifficultyChoice;
+      /** Chain length in words. See WORD_CHAIN_LENGTH_OPTIONS. */
+      length: number;
     },
     ack?: (res: AckResult<{ ok: true }>) => void
   ) => void;

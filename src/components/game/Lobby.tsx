@@ -11,9 +11,12 @@ import {
   GEO_DEFAULT_DURATION_SEC,
   GEO_DURATION_OPTIONS_SEC,
   WORD_CHAIN_DEFAULT_DURATION_SEC,
+  WORD_CHAIN_DEFAULT_LENGTH,
   WORD_CHAIN_DIFFICULTY_CHOICES,
   WORD_CHAIN_DIFFICULTY_LABELS,
   WORD_CHAIN_DURATION_OPTIONS_SEC,
+  WORD_CHAIN_LENGTH_LABELS,
+  WORD_CHAIN_LENGTH_OPTIONS,
   type GameType,
   type WordChainDifficultyChoice,
 } from "@/shared/types";
@@ -50,6 +53,9 @@ export function Lobby() {
   );
   const [wordDifficulty, setWordDifficulty] =
     useState<WordChainDifficultyChoice>("any");
+  const [wordLength, setWordLength] = useState<number>(
+    WORD_CHAIN_DEFAULT_LENGTH
+  );
   const [hostPlaying, setHostPlaying] = useState(false);
   const [copied, setCopied] = useState(false);
 
@@ -121,7 +127,12 @@ export function Lobby() {
       if (selected === "geo_guessr") {
         await startGeoGame(geoDuration, hostWillPlay);
       } else if (selected === "word_chain") {
-        await startWordChain(wordDuration, hostWillPlay, wordDifficulty);
+        await startWordChain(
+          wordDuration,
+          hostWillPlay,
+          wordDifficulty,
+          wordLength
+        );
       } else {
         await startSubmission();
       }
@@ -234,6 +245,37 @@ export function Lobby() {
                 format={(sec) => `${sec / 60} min`}
               />
               <p className="mb-2 mt-4 text-sm font-semibold text-white/70">
+                Chain length
+              </p>
+              {/* A grid, not a row: five options don't fit side by side on a
+                  phone without shrinking the labels to nothing. */}
+              <div className="grid grid-cols-3 gap-2">
+                {WORD_CHAIN_LENGTH_OPTIONS.map((words) => (
+                  <button
+                    key={words}
+                    onClick={() => setWordLength(words)}
+                    className={`rounded-xl border-2 px-2 py-2 text-sm font-semibold transition-all ${
+                      wordLength === words
+                        ? "border-fuchsia-400 bg-fuchsia-400/15"
+                        : "border-white/10 bg-white/5 hover:border-white/30"
+                    }`}
+                  >
+                    {WORD_CHAIN_LENGTH_LABELS[words]}
+                    <span className="block text-xs font-normal text-white/40">
+                      {words - 2} blanks
+                    </span>
+                  </button>
+                ))}
+              </div>
+              {wordLength >= 12 && wordDuration < 300 && (
+                <p className="mt-2 text-xs text-amber-300/80">
+                  {wordLength - 2} blanks is a lot for{" "}
+                  {wordDuration / 60} minute
+                  {wordDuration === 60 ? "" : "s"} — consider 5 minutes.
+                </p>
+              )}
+
+              <p className="mb-2 mt-4 text-sm font-semibold text-white/70">
                 Difficulty
               </p>
               <div className="flex gap-2">
@@ -254,9 +296,10 @@ export function Lobby() {
 
               <p className="mt-2 text-xs text-white/40">
                 One puzzle, everyone racing the same clock, solving in from both
-                ends. Nobody is dealt a chain they&apos;ve played before.
-                Difficulty is how many words fit each blank before the first
-                letter narrows it down.
+                ends. Nobody is dealt a chain they&apos;ve played before. Every
+                length is worth the same 5,000, so pick on feel. Difficulty is
+                how many words fit each blank before the first letter narrows it
+                down.
               </p>
               <HostPlayingToggle
                 checked={hostWillPlay}

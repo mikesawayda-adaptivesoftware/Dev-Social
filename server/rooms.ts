@@ -5,6 +5,7 @@ import {
   GEO_DEFAULT_DURATION_SEC,
   MAX_PLAYERS_PER_ROOM,
   WORD_CHAIN_DEFAULT_DURATION_SEC,
+  WORD_CHAIN_DEFAULT_LENGTH,
   isGameEnabled,
   isKnownGameType,
   type GameSettings,
@@ -193,19 +194,26 @@ const MAX_GEO_POINTS = 5000;
 // Distance (km) scale for the exponential score decay. Larger = more forgiving.
 const GEO_SCORE_SCALE_KM = 1500;
 
-// Word Chain scoring. Every puzzle in the bank is four blanks, so a clean
-// instant sweep tops out at 4x500 + 1000 + 2000 = 5000 — the same ceiling as a
-// perfect GeoGuessr round, which keeps the two games' scores on one scale.
+// Word Chain scoring. A clean instant sweep tops out at 2000 + 1000 + 2000 =
+// 5000 — the same ceiling as a perfect GeoGuessr round, which keeps the two
+// games' scores on one scale.
+//
+// The solve points are a fixed pot *split across however many blanks the chain
+// has*, rather than a rate per blank. Chains come in several lengths now, and a
+// rate would make a six-blank chain worth half as much again as a four-blank
+// one — so the season leaderboard would quietly reward whoever picked "long"
+// rather than whoever played well.
 //
 // The shape matters more than the numbers: partial credit per link means a
 // player who runs out of time still scores, while the completion and speed
 // bonuses are what make it a race rather than a crossword.
-const WORD_CHAIN_LINK_POINTS = 500;
+const WORD_CHAIN_SOLVE_POINTS = 2000;
 const WORD_CHAIN_FINISH_BONUS = 1000;
 const WORD_CHAIN_SPEED_BONUS_MAX = 2000;
-// A hint costs less than a link is worth, so buying one is never worse than
-// giving up on the word — but four of them eat most of a link.
-const WORD_CHAIN_HINT_PENALTY = 100;
+// A hint costs a fifth of a link, so buying one is never worse than giving up
+// on the word, and it costs the same share of the game whatever the length.
+// (At four blanks that's the flat 100 this started out as.)
+const WORD_CHAIN_HINT_FRACTION = 0.2;
 
 /** Great-circle distance between two lat/lng points, in kilometers. */
 function haversineKm(
@@ -725,7 +733,8 @@ export class RoomStore {
     playerId: string,
     durationSec: number,
     hostPlaying: boolean,
-    difficulty: WordChainDifficultyChoice = "any"
+    difficulty: WordChainDifficultyChoice = "any",
+    length: number = WORD_CHAIN_DEFAULT_LENGTH
   ) {
     const room = this.requireRoom(code);
     this.requireHost(room, playerId);
@@ -746,16 +755,25 @@ export class RoomStore {
     // Only when this group has collectively played the entire bank does it fall
     // back to the least-seen chain. Shuffle first so the fallback's stable sort
     // breaks ties randomly, and so the unseen case is a plain random pick.
-    // Difficulty narrows the bank first, then the never-repeat rule picks
-    // within it. That ordering matters: honouring the host's choice and then
-    // falling back to least-seen inside the tier keeps a group that has
-    // exhausted "hard" on hard puzzles, rather than quietly handing them an
-    // easy one.
+    // The host's choices narrow the bank first, then the never-repeat rule
+    // picks within what's left. That ordering matters: honouring the choice and
+    // then falling back to least-seen inside it keeps a group that has
+    // exhausted "hard" on hard puzzles rather than quietly handing them an easy
+    // one.
+    //
+    // Length doesn't give way at all. A tier that can't be filled is a runtime
+    // condition worth absorbing quietly; a length with no chains behind it is a
+    // bug in the bank, and silently handing over a different-shaped puzzle
+    // would hide it from everyone including whoever picked it.
+    const byLength = WORD_CHAINS.filter((p) => p.words.length === length);
+    if (byLength.length === 0) {
+      throw new RoomError("That chain length isn't available right now.");
+    }
     const tier =
       difficulty === "any"
-        ? WORD_CHAINS
-        : WORD_CHAINS.filter((p) => p.difficulty === difficulty);
-    const pool = tier.length > 0 ? tier : WORD_CHAINS;
+        ? byLength
+        : byLength.filter((p) => p.difficulty === difficulty);
+    const pool = tier.length > 0 ? tier : byLength;
 
     const seen = await getSeenPuzzleCounts(competitorNames);
     const unseen = pool.filter((p) => !seen.has(p.id));
@@ -960,6 +978,14 @@ export class RoomStore {
     };
   }
 
+  /** What one hint costs on this chain — a fifth of what a link is worth. */
+  private wordChainHintCost(round: WordChainRound): number {
+    return Math.round(
+      (WORD_CHAIN_SOLVE_POINTS / this.blankCount(round)) *
+        WORD_CHAIN_HINT_FRACTION
+    );
+  }
+
   /** What one player's run is worth. Recomputed rather than accumulated, so
    * there's one definition of the score and no drift between the live view and
    * what lands on the scoreboard. */
@@ -967,9 +993,14 @@ export class RoomStore {
     round: WordChainRound,
     progress: WordChainProgress
   ): number {
-    let points =
-      this.solvedCount(progress) * WORD_CHAIN_LINK_POINTS -
-      progress.hintsUsed * WORD_CHAIN_HINT_PENALTY;
+    const blanks = this.blankCount(round);
+    // Rounded once off the fraction solved, not accumulated per blank, so the
+    // pot always adds up exactly however it divides.
+    const linkValue = WORD_CHAIN_SOLVE_POINTS / blanks;
+    let points = Math.round(
+      this.solvedCount(progress) * linkValue -
+        progress.hintsUsed * linkValue * WORD_CHAIN_HINT_FRACTION
+    );
     if (progress.finishedMs !== undefined) {
       const remaining = Math.max(
         0,
@@ -1446,6 +1477,7 @@ export class RoomStore {
             finished: mine?.finishedMs !== undefined,
             myPoints: mine ? this.wordChainPoints(round, mine) : 0,
             hintsUsed: mine?.hintsUsed ?? 0,
+            hintCost: this.wordChainHintCost(round),
             standings: competitorIds.map((id) => {
               const p = round.progress.get(id);
               return {

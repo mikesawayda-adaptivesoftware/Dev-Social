@@ -67,7 +67,8 @@ interface GameContextValue {
   startWordChain: (
     durationSec: number,
     hostPlaying: boolean,
-    difficulty: WordChainDifficultyChoice
+    difficulty: WordChainDifficultyChoice,
+    length: number
   ) => Promise<void>;
   submitWordGuess: (
     index: number,
@@ -491,12 +492,13 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     (
       durationSec: number,
       hostPlaying: boolean,
-      difficulty: WordChainDifficultyChoice
+      difficulty: WordChainDifficultyChoice,
+      length: number
     ) =>
       new Promise<void>((resolve, reject) => {
         getSocket().emit(
           "host:startWordChain",
-          { durationSec, hostPlaying, difficulty },
+          { durationSec, hostPlaying, difficulty, length },
           (res: AckResult<{ ok: true }>) => {
             if (res?.ok) {
               resolve();
