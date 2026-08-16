@@ -327,6 +327,26 @@ export class RoomStore {
       .map((p) => p.name);
   }
 
+  /**
+   * The competitors a game would start with, or a user-facing throw when that's
+   * nobody.
+   *
+   * One is enough. A lone player still has a real game — a clock, a score, a
+   * leaderboard row — and refusing to start it only ever turned away the person
+   * who wanted to try the thing out. What has to be rejected is a game with
+   * *zero* competitors, which is what a host running the big screen with an
+   * empty room would produce.
+   */
+  private requireCompetitors(room: Room, hostPlaying: boolean): string[] {
+    const names = this.competitorNames(room, hostPlaying);
+    if (names.length < 1) {
+      throw new RoomError(
+        "Nobody's playing — tick “I'm playing too” or wait for someone to join."
+      );
+    }
+    return names;
+  }
+
   async createRoom(
     name: string,
     pin: string,
@@ -579,17 +599,7 @@ export class RoomStore {
     if (room.phase !== "lobby") {
       throw new RoomError("You can only start a game from the lobby.");
     }
-    if (room.players.size < 2) {
-      throw new RoomError("Need at least 2 players to start.");
-    }
-    // At least one competitor is required (if the host sits out, someone else
-    // must be playing).
-    const competitors = hostPlaying
-      ? room.players.size
-      : room.players.size - 1;
-    if (competitors < 1) {
-      throw new RoomError("Need at least one player besides the host.");
-    }
+    const competitorNames = this.requireCompetitors(room, hostPlaying);
     const duration = Number.isFinite(roundDurationSec)
       ? Math.max(30, Math.min(300, Math.round(roundDurationSec)))
       : GEO_DEFAULT_DURATION_SEC;
@@ -599,10 +609,6 @@ export class RoomStore {
     // shuffle first (random tie-break), then stable-sort by how many of them
     // have already seen each spot. This never blocks: once everyone has seen
     // everything, it simply falls back to the least-seen locations.
-    // Read `hostPlaying` from the argument, not from the room: it isn't
-    // committed until the game actually starts, so `isSpectator` would still be
-    // answering for the last game and drop a playing host from the history.
-    const competitorNames = this.competitorNames(room, hostPlaying);
     const seenCounts = await getSeenCounts(competitorNames);
     const pool = shuffle(GEO_LOCATIONS).sort(
       (a, b) => (seenCounts.get(a.id) ?? 0) - (seenCounts.get(b.id) ?? 0)
@@ -718,12 +724,7 @@ export class RoomStore {
     if (room.phase !== "lobby") {
       throw new RoomError("You can only start a game from the lobby.");
     }
-    const competitorNames = this.competitorNames(room, hostPlaying);
-    if (competitorNames.length < 1) {
-      throw new RoomError(
-        "Nobody's playing — tick “I’m playing too” or wait for someone to join."
-      );
-    }
+    const competitorNames = this.requireCompetitors(room, hostPlaying);
     const duration = Number.isFinite(durationSec)
       ? Math.max(30, Math.min(600, Math.round(durationSec)))
       : WORD_CHAIN_DEFAULT_DURATION_SEC;
