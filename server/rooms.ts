@@ -761,11 +761,14 @@ export class RoomStore {
     // exhausted "hard" on hard puzzles rather than quietly handing them an easy
     // one.
     //
-    // Length gives way last. It's the visible one — a host who asked for long
-    // chains would notice a short one immediately, where a difficulty that
-    // slipped a tier just plays as a slightly easier round.
-    const wanted = WORD_CHAINS.filter((p) => p.words.length === length);
-    const byLength = wanted.length > 0 ? wanted : WORD_CHAINS;
+    // Length doesn't give way at all. A tier that can't be filled is a runtime
+    // condition worth absorbing quietly; a length with no chains behind it is a
+    // bug in the bank, and silently handing over a different-shaped puzzle
+    // would hide it from everyone including whoever picked it.
+    const byLength = WORD_CHAINS.filter((p) => p.words.length === length);
+    if (byLength.length === 0) {
+      throw new RoomError("That chain length isn't available right now.");
+    }
     const tier =
       difficulty === "any"
         ? byLength

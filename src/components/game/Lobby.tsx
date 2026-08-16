@@ -247,12 +247,14 @@ export function Lobby() {
               <p className="mb-2 mt-4 text-sm font-semibold text-white/70">
                 Chain length
               </p>
-              <div className="flex gap-2">
+              {/* A grid, not a row: five options don't fit side by side on a
+                  phone without shrinking the labels to nothing. */}
+              <div className="grid grid-cols-3 gap-2">
                 {WORD_CHAIN_LENGTH_OPTIONS.map((words) => (
                   <button
                     key={words}
                     onClick={() => setWordLength(words)}
-                    className={`flex-1 rounded-xl border-2 px-2 py-2 text-sm font-semibold transition-all ${
+                    className={`rounded-xl border-2 px-2 py-2 text-sm font-semibold transition-all ${
                       wordLength === words
                         ? "border-fuchsia-400 bg-fuchsia-400/15"
                         : "border-white/10 bg-white/5 hover:border-white/30"
@@ -265,6 +267,13 @@ export function Lobby() {
                   </button>
                 ))}
               </div>
+              {wordLength >= 12 && wordDuration < 300 && (
+                <p className="mt-2 text-xs text-amber-300/80">
+                  {wordLength - 2} blanks is a lot for{" "}
+                  {wordDuration / 60} minute
+                  {wordDuration === 60 ? "" : "s"} — consider 5 minutes.
+                </p>
+              )}
 
               <p className="mb-2 mt-4 text-sm font-semibold text-white/70">
                 Difficulty

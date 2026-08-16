@@ -124,7 +124,7 @@ const main = async () => {
     await checkDifficultyFilter(tier);
   }
   const blankCounts = [];
-  for (const words of [5, 6, 8]) {
+  for (const words of [5, 6, 8, 12, 17]) {
     blankCounts.push(await checkLength(words));
   }
   assert(

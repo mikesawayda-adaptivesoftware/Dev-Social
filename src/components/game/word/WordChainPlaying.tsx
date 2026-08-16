@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useGame } from "@/components/GameProvider";
 import { useCountdown } from "@/lib/useCountdown";
 import { WORD_CHAIN_DIFFICULTY_LABELS } from "@/shared/types";
@@ -12,6 +12,10 @@ import {
   RaceBoard,
 } from "./ChainBoard";
 import { WordChainBigScreen } from "./WordChainBigScreen";
+
+/** Above this many blanks the chain is taller than a phone screen, so the two
+ * frontiers stop being visible at once and focus has to drag the view with it. */
+const LONG_ENOUGH_TO_SCROLL = 6;
 
 export function WordChainPlaying() {
   const { state, me, submitWordGuess, revealWordHint } = useGame();
@@ -31,6 +35,9 @@ export function WordChainPlaying() {
   // Which end the player is working from, so that solving a blank hands focus
   // to the next one on *that* side instead of jumping across the chain.
   const [side, setSide] = useState<"front" | "back">("front");
+  // Which blank we've already scrolled to, so the ref callback below doesn't
+  // re-scroll on every render.
+  const scrolledTo = useRef<number | null>(null);
 
   if (!state || !word) {
     return null;
@@ -159,6 +166,24 @@ export function WordChainPlaying() {
                         // Focus follows the end the player is working from, so
                         // solving a blank continues the run instead of hopping.
                         autoFocus={i === focused}
+                        ref={(el) => {
+                          // On a long chain the two frontiers are further apart
+                          // than a phone screen, so following the focus has to
+                          // mean scrolling to it as well as typing into it.
+                          // Short chains fit, and would only get a jolt.
+                          if (
+                            el &&
+                            i === focused &&
+                            total > LONG_ENOUGH_TO_SCROLL &&
+                            scrolledTo.current !== i
+                          ) {
+                            scrolledTo.current = i;
+                            el.scrollIntoView({
+                              block: "center",
+                              behavior: "smooth",
+                            });
+                          }
+                        }}
                         value={drafts[i] ?? ""}
                         onFocus={() =>
                           setSide(i === active[0] ? "front" : "back")

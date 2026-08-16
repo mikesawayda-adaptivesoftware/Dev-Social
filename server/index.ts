@@ -9,6 +9,8 @@ import {
   supabaseEnabled,
   uploadPhoto,
 } from "./supabase";
+import { WORD_CHAIN_LENGTH_OPTIONS } from "../src/shared/types";
+import { WORD_CHAINS } from "./wordChains";
 import type {
   ClientToServerEvents,
   ServerToClientEvents,
@@ -438,8 +440,28 @@ setInterval(() => {
   broadcastPublicRooms();
 }, 1000 * 60 * 2);
 
+/**
+ * The lobby offers chain lengths from a constant, while the chains themselves
+ * are generated into a separate file. Nothing in the type system ties the two
+ * together, so say so at boot \u2014 otherwise the first sign of a mismatch is a
+ * host picking a length and being told it isn't available.
+ */
+function checkWordChainLengths() {
+  const missing = WORD_CHAIN_LENGTH_OPTIONS.filter(
+    (length) => !WORD_CHAINS.some((p) => p.words.length === length)
+  );
+  if (missing.length) {
+    console.error(
+      `\u26A0 Word Chain: the lobby offers ${missing.join("/")}-word chains ` +
+        `but the bank has none. Run scripts/generateWordChains.mjs, or drop ` +
+        `them from WORD_CHAIN_LENGTH_OPTIONS.`
+    );
+  }
+}
+
 httpServer.listen(PORT, () => {
   console.log(`\u25B6 Realtime game server listening on http://localhost:${PORT}`);
+  checkWordChainLengths();
   console.log(
     supabaseEnabled
       ? "\u2713 Supabase connected — games persist + photos go to Storage."

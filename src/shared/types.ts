@@ -316,20 +316,22 @@ export const WORD_CHAIN_DEFAULT_DURATION_SEC = 120;
 
 /**
  * Chain lengths the host can pick, in words. Two of every chain are given, so
- * these are 3, 4 and 6 blanks to fill.
+ * these are 3, 4, 6, 10 and 15 blanks to fill.
  *
  * Every length is worth the same 5,000 — the solve points are a fixed pot split
  * across the blanks — so this changes how the puzzle feels, not what it pays.
  * Must stay in step with CHAIN_LENGTHS in scripts/generateWordChains.mjs, which
  * is what decides the lengths the bank actually contains.
  */
-export const WORD_CHAIN_LENGTH_OPTIONS = [5, 6, 8] as const;
+export const WORD_CHAIN_LENGTH_OPTIONS = [5, 6, 8, 12, 17] as const;
 export const WORD_CHAIN_DEFAULT_LENGTH = 6;
 
 export const WORD_CHAIN_LENGTH_LABELS: Record<number, string> = {
   5: "Short",
   6: "Standard",
   8: "Long",
+  12: "Epic",
+  17: "Marathon",
 };
 
 /**

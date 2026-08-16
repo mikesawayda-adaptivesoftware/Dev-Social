@@ -90,8 +90,8 @@ phones using your machine's network URL (printed by Next as `Network:`), e.g.
 
 1. **Host** creates a room and, in the lobby, picks **Word Chain**, the time
    limit (**1 / 2 / 5 minutes**), the **chain length** (Short / Standard / Long
-   — 3, 4 or 6 blanks) and the **difficulty** (Any / Easy / Normal / Hard).
-   "I'm playing too" is on by default here.
+   / Epic / Marathon — **3, 4, 6, 10 or 15 blanks**) and the **difficulty**
+   (Any / Easy / Normal / Hard). "I'm playing too" is on by default here.
 2. Everyone **joins** from their phone with the code + their name. One player is
    fine — you're racing the clock either way (see the solo note above).
 3. Host starts → everyone gets **the same chain** at the same time: two words
@@ -133,12 +133,22 @@ phones using your machine's network URL (printed by Next as `Network:`), e.g.
 > `player_word_chains_seen` table, so this needs Supabase configured — in local
 > mode the pick is simply random.
 >
-> The bank ships **1,051 chains** — 400 short, 500 standard, 151 long. Long
-> chains are the scarce ones: every blank has to be unambiguous from both sides
-> (below), and six in a row is a much harder ask of the graph than three. Each
-> length is its own never-repeat pool, so the pools are independent.
+> Each length is its own never-repeat pool, so the pools are independent.
 >
-> To grow it, add links to the `LINKS` table in
+> **How many chains a length can have** is set by `MAX_SHARED_FRACTION` — the
+> share of its links a chain may have in common with any other. It's a *share*
+> for a reason: a flat "no more than 2 links in common" is 50% of a four-link
+> chain but 12% of a sixteen-link one, so a fixed number silently strangles long
+> chains. The graph itself has no trouble with length — well-posed chains exist
+> out past 20 blanks.
+>
+> The real cost of long chains is sameness, not scarcity. They have to run
+> through the same hub words (UP, SIDE, OVER, WORK, OUT), so two long chains
+> resemble each other more than two short ones do. That's what the fraction is
+> trading against; lower it if long chains start feeling repetitive, and accept
+> a smaller pool.
+>
+> To grow the bank, add links to the `LINKS` table in
 > `scripts/generateWordChains.mjs` and re-run it — the chains are walked out of
 > that graph, so a link that isn't a real compound is the one bug that matters
 > here and the table is the only thing worth reviewing.
