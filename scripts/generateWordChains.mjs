@@ -28,7 +28,7 @@ const TARGET = Number(process.argv[2] ?? 500);
 const CHAIN_LENGTH = 6; // 4 blanks, so every puzzle scores out of the same total
 // How many chains may reuse one link. Low enough that no one link becomes a
 // motif across the bank, high enough to reach the target from this many links.
-const MAX_LINK_USES = 6;
+const MAX_LINK_USES = 12;
 // …and how many links two chains may have in common. The cap above bounds how
 // often a link appears but not how much any *pair* of chains overlaps: two
 // puzzles sharing 4 of their 5 links are the same puzzle wearing a hat, and
@@ -488,6 +488,117 @@ const adjacency = new Map(
   Object.entries(LINKS).map(([from, to]) => [from, to.split(" ")])
 );
 
+/** The same graph backwards, for approaching a blank from the word below it. */
+const reverse = new Map();
+for (const [from, targets] of adjacency) {
+  for (const to of targets) {
+    const sources = reverse.get(to);
+    if (sources) {
+      sources.push(from);
+    } else {
+      reverse.set(to, [from]);
+    }
+  }
+}
+
+/**
+ * Letters of an answer shown for free. Must match `freeLetters` in
+ * server/wordChains.ts — this is the model of what the player can see, and the
+ * uniqueness guarantee below is only worth anything if it matches reality.
+ */
+const freeLetters = (word) => (word.length > 2 ? 1 : 0);
+
+/**
+ * Every word that fits a blank as far as the player can tell: it links to the
+ * neighbour they're working from, and it matches the length and the free
+ * letters on show.
+ */
+function candidates(neighbour, answer, direction) {
+  const pool =
+    (direction === "down" ? adjacency.get(neighbour) : reverse.get(neighbour)) ??
+    [];
+  const shown = answer.slice(0, freeLetters(answer));
+  return pool.filter(
+    (word) => word.length === answer.length && word.startsWith(shown)
+  );
+}
+
+/**
+ * How hard one blank is: the number of words that fit its *shape* — right
+ * length, right neighbour — before the free first letter narrows it down.
+ *
+ * One means the length alone gives it away. Eight means the player has to hold
+ * the letter in mind and work through the options, which is the difference
+ * between filling a chain and solving one. Taken as the smaller of the two
+ * directions, because a player works from whichever end is easier.
+ */
+function blankEffort(words, i) {
+  const answer = words[i];
+  const fits = (neighbour, direction) => {
+    const pool =
+      (direction === "down"
+        ? adjacency.get(neighbour)
+        : reverse.get(neighbour)) ?? [];
+    return pool.filter((word) => word.length === answer.length).length;
+  };
+  return Math.min(
+    fits(words[i - 1], "down"),
+    fits(words[i + 1], "up")
+  );
+}
+
+/** A chain's difficulty score: the effort of its blanks, added up. */
+function chainEffort(words) {
+  let total = 0;
+  for (let i = 1; i < words.length - 1; i++) {
+    total += blankEffort(words, i);
+  }
+  return total;
+}
+
+// Cut points from the score distribution across the bank, which is skewed low:
+// they split it near evenly rather than into equal score ranges.
+//
+// Honest about what this measures: how much narrowing the free letter has to do
+// inside *our* link graph, not how obscure the compound is in English. A blank
+// the graph pins by length alone can still need a word you'd not have thought
+// of. It's a good knob, not a promise.
+const EASY_AT_MOST = 5;
+const NORMAL_AT_MOST = 7;
+
+function difficultyOf(words) {
+  const effort = chainEffort(words);
+  if (effort <= EASY_AT_MOST) {
+    return "easy";
+  }
+  return effort <= NORMAL_AT_MOST ? "normal" : "hard";
+}
+
+/**
+ * True when every blank has exactly one answer, from both directions.
+ *
+ * This is the difference between a puzzle and a guessing game. A blank is
+ * presented as "a word that follows BED, four letters, starts with R" — and if
+ * both ROOM and ROCK satisfy that, then a player who types ROCK has solved the
+ * puzzle as posed and is told they're wrong. Mid race, that's the worst moment
+ * the game can produce.
+ *
+ * Checked in both directions because a player may work up from the last word as
+ * well as down from the first, and a blank that is unique one way round can have
+ * two answers the other.
+ */
+function wellPosed(words) {
+  for (let i = 1; i < words.length - 1; i++) {
+    if (candidates(words[i - 1], words[i], "down").length !== 1) {
+      return false;
+    }
+    if (candidates(words[i + 1], words[i], "up").length !== 1) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** Deterministic PRNG, so re-running produces the same bank. */
 function mulberry32(seed) {
   return function () {
@@ -512,13 +623,23 @@ function shuffled(items) {
 
 // --- Existing bank -------------------------------------------------------
 
+// `[^}]*` after the word list so that fields added later (difficulty, and
+// whatever comes next) don't make existing chains invisible to the reader —
+// which would silently renumber the whole bank.
 const source = readFileSync(BANK, "utf8");
-const existing = [
-  ...source.matchAll(/\{\s*id:\s*"([^"]+)",\s*words:\s*\[([^\]]+)\]\s*\}/g),
+const found = [
+  ...source.matchAll(/\{\s*id:\s*"([^"]+)",\s*words:\s*\[([^\]]+)\][^}]*\}/g),
 ].map(([, id, list]) => ({
   id,
   words: [...list.matchAll(/"([A-Z]+)"/g)].map((m) => m[1]),
 }));
+
+// Existing chains are re-checked, not trusted. Growing LINKS can retroactively
+// give an old blank a second answer, and a puzzle that can tell a correct player
+// they're wrong is worth losing. Dropping one is safe: `player_word_chains_seen`
+// rows for an id no longer in the bank simply never match anything.
+const existing = found.filter((c) => wellPosed(c.words));
+const dropped = found.filter((c) => !wellPosed(c.words));
 
 const chains = [...existing];
 const usedIds = new Set(existing.map((c) => c.id));
@@ -583,7 +704,9 @@ function findChain(start) {
 
   function step() {
     if (path.length === CHAIN_LENGTH) {
-      return !seenChains.has(path.join(" ")) && !tooSimilar(path);
+      return (
+        !seenChains.has(path.join(" ")) && wellPosed(path) && !tooSimilar(path)
+      );
     }
     const here = path[path.length - 1];
     for (const next of shuffled(adjacency.get(here) ?? [])) {
@@ -674,9 +797,27 @@ for (const { id, words } of chains) {
       problems.push(`${id}: "${word}" isn't plain uppercase letters`);
     }
   }
+  if (!["easy", "normal", "hard"].includes(difficultyOf(words))) {
+    problems.push(`${id}: scored into no difficulty tier`);
+  }
   for (let i = 0; i < words.length - 1; i++) {
     if (!(adjacency.get(words[i]) ?? []).includes(words[i + 1])) {
       problems.push(`${id}: ${words[i]} + ${words[i + 1]} is not a known link`);
+    }
+  }
+  for (let i = 1; i < words.length - 1; i++) {
+    for (const [dir, neighbour] of [
+      ["down", words[i - 1]],
+      ["up", words[i + 1]],
+    ]) {
+      const fits = candidates(neighbour, words[i], dir);
+      if (fits.length !== 1) {
+        problems.push(
+          `${id}: going ${dir} from ${neighbour}, blank ${i} accepts ${fits.join(
+            "/"
+          )} — must accept only ${words[i]}`
+        );
+      }
     }
   }
 }
@@ -693,12 +834,15 @@ if (problems.length) {
 // Only the array literal is replaced; the header, types and helpers around it
 // are hand-maintained and stay put.
 
+// Difficulty is recomputed for every chain, kept ones included — it's derived
+// from the link graph, so growing LINKS can legitimately move a chain between
+// tiers. Only the id is sacred.
 const body = chains
   .map(
     ({ id, words }) =>
       `  { id: ${JSON.stringify(id)}, words: [${words
         .map((w) => JSON.stringify(w))
-        .join(", ")}] },`
+        .join(", ")}], difficulty: ${JSON.stringify(difficultyOf(words))} },`
   )
   .join("\n");
 
@@ -722,11 +866,20 @@ const distinctWords = new Set(chains.flatMap((c) => c.words)).size;
 // "in play" that no puzzle actually uses.
 const linksInPlay = new Set(chains.flatMap((c) => linksOf(c.words))).size;
 const linkTotal = [...adjacency.values()].reduce((n, t) => n + t.length, 0);
+const tiers = chains.reduce((counts, c) => {
+  const tier = difficultyOf(c.words);
+  counts[tier] = (counts[tier] ?? 0) + 1;
+  return counts;
+}, {});
 console.log(
-  `${chains.length} chains (${existing.length} kept, ${added} added)\n` +
+  `${chains.length} chains (${existing.length} kept, ${added} added` +
+    `${dropped.length ? `, ${dropped.length} dropped as ambiguous` : ""})\n` +
     `${distinctStarts} distinct opening words, ${distinctWords} distinct words used\n` +
     `${linksInPlay} of ${linkTotal} links in play, at most ${MAX_LINK_USES} uses ` +
-    `each and at most ${MAX_SHARED_LINKS} shared between any two chains`
+    `each and at most ${MAX_SHARED_LINKS} shared between any two chains\n` +
+    `difficulty: ${tiers.easy ?? 0} easy, ${tiers.normal ?? 0} normal, ${
+      tiers.hard ?? 0
+    } hard`
 );
 if (chains.length < TARGET) {
   console.log(

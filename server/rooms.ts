@@ -14,6 +14,8 @@ import {
   type PublicPlayer,
   type PublicRoomSummary,
   type RoomVisibility,
+  type WordChainDifficulty,
+  type WordChainDifficultyChoice,
   type WordChainGuessResult,
   type WordChainStanding,
 } from "../src/shared/types";
@@ -118,10 +120,17 @@ interface GeoRound {
   closed: boolean;
 }
 
-/** One player's run at the current chain. Blanks are solved top down, so
- * `solved` doubles as the index of the blank they're on. */
+/**
+ * One player's run at the current chain.
+ *
+ * Solved from both ends inwards, so progress is two counters rather than one:
+ * `solvedFront` blanks filled from the top, `solvedBack` from the bottom. That
+ * leaves at most two blanks open at a time — one at each frontier — and being
+ * stuck on a link stops you moving one way rather than stopping you dead.
+ */
 interface WordChainProgress {
-  solved: number;
+  solvedFront: number;
+  solvedBack: number;
   /** Extra letters bought per blank, index-aligned with the chain's blanks. */
   hints: number[];
   hintsUsed: number;
@@ -133,6 +142,7 @@ interface WordChainProgress {
 interface WordChainRound {
   id: string;
   puzzleId: string;
+  difficulty: WordChainDifficulty;
   /** The whole chain. `words[0]` and the last word are given; the rest are the
    * blanks, so a six-word chain is four blanks. Never sent to clients wholesale
    * until the reveal. */
@@ -714,7 +724,8 @@ export class RoomStore {
     code: string,
     playerId: string,
     durationSec: number,
-    hostPlaying: boolean
+    hostPlaying: boolean,
+    difficulty: WordChainDifficultyChoice = "any"
   ) {
     const room = this.requireRoom(code);
     this.requireHost(room, playerId);
@@ -735,9 +746,20 @@ export class RoomStore {
     // Only when this group has collectively played the entire bank does it fall
     // back to the least-seen chain. Shuffle first so the fallback's stable sort
     // breaks ties randomly, and so the unseen case is a plain random pick.
+    // Difficulty narrows the bank first, then the never-repeat rule picks
+    // within it. That ordering matters: honouring the host's choice and then
+    // falling back to least-seen inside the tier keeps a group that has
+    // exhausted "hard" on hard puzzles, rather than quietly handing them an
+    // easy one.
+    const tier =
+      difficulty === "any"
+        ? WORD_CHAINS
+        : WORD_CHAINS.filter((p) => p.difficulty === difficulty);
+    const pool = tier.length > 0 ? tier : WORD_CHAINS;
+
     const seen = await getSeenPuzzleCounts(competitorNames);
-    const unseen = WORD_CHAINS.filter((p) => !seen.has(p.id));
-    const puzzle = shuffle(unseen.length > 0 ? unseen : WORD_CHAINS).sort(
+    const unseen = pool.filter((p) => !seen.has(p.id));
+    const puzzle = shuffle(unseen.length > 0 ? unseen : pool).sort(
       (a, b) => (seen.get(a.id) ?? 0) - (seen.get(b.id) ?? 0)
     )[0];
 
@@ -748,6 +770,7 @@ export class RoomStore {
       {
         id: nanoid(8),
         puzzleId: puzzle.id,
+        difficulty: puzzle.difficulty,
         words: [...puzzle.words],
         progress: new Map<string, WordChainProgress>(),
         startedAt: 0,
@@ -772,10 +795,57 @@ export class RoomStore {
   ): WordChainProgress {
     let progress = round.progress.get(playerId);
     if (!progress) {
-      progress = { solved: 0, hints: [], hintsUsed: 0, wrongGuesses: 0 };
+      progress = {
+        solvedFront: 0,
+        solvedBack: 0,
+        hints: [],
+        hintsUsed: 0,
+        wrongGuesses: 0,
+      };
       round.progress.set(playerId, progress);
     }
     return progress;
+  }
+
+  /** How many blanks a chain has. */
+  private blankCount(round: WordChainRound): number {
+    return round.words.length - 2;
+  }
+
+  /** Blanks filled so far, from both ends. */
+  private solvedCount(progress: WordChainProgress | undefined): number {
+    return progress ? progress.solvedFront + progress.solvedBack : 0;
+  }
+
+  /**
+   * The blanks this player may answer right now: the frontier from the top and
+   * the frontier from the bottom. Two while they're apart, one when they meet
+   * on the last blank, none once the chain is done.
+   */
+  private activeBlanks(
+    round: WordChainRound,
+    progress: WordChainProgress | undefined
+  ): number[] {
+    const total = this.blankCount(round);
+    const front = progress?.solvedFront ?? 0;
+    const back = total - 1 - (progress?.solvedBack ?? 0);
+    if (front > back) {
+      return [];
+    }
+    return front === back ? [front] : [front, back];
+  }
+
+  /** Whether a blank has already been filled, from either direction. */
+  private isBlankSolved(
+    round: WordChainRound,
+    progress: WordChainProgress | undefined,
+    index: number
+  ): boolean {
+    const total = this.blankCount(round);
+    return (
+      index < (progress?.solvedFront ?? 0) ||
+      index > total - 1 - (progress?.solvedBack ?? 0)
+    );
   }
 
   /** The round a Word Chain player must be in to act, or a user-facing throw. */
@@ -809,27 +879,35 @@ export class RoomStore {
     guess: string
   ): WordChainGuessResult {
     const { room, round, progress } = this.requireWordRound(code, playerId);
-    const blankCount = round.words.length - 2;
+    const solved = this.solvedCount(progress);
 
     if (progress.finishedMs !== undefined) {
-      return { correct: false, solved: progress.solved, finished: true };
+      return { correct: false, solved, finished: true };
     }
-    // A mismatched index means the client is answering a blank it has already
-    // moved past (a retried emit, say). Ignore it rather than crediting this
-    // answer to the wrong word.
-    if (index !== progress.solved) {
-      return { correct: false, solved: progress.solved, finished: false };
+    // An index that isn't currently open means the client is answering a blank
+    // it has already moved past — a retried emit, or a stale view. Ignore it
+    // rather than crediting the answer to the wrong word.
+    const active = this.activeBlanks(round, progress);
+    if (!active.includes(index)) {
+      return { correct: false, solved, finished: false };
     }
 
-    const answer = normalizeWord(round.words[progress.solved + 1]);
+    const answer = normalizeWord(round.words[index + 1]);
     if (normalizeWord(guess) !== answer) {
       progress.wrongGuesses += 1;
       this.touch(room);
-      return { correct: false, solved: progress.solved, finished: false };
+      return { correct: false, solved, finished: false };
     }
 
-    progress.solved += 1;
-    const finished = progress.solved >= blankCount;
+    // Advance whichever frontier this blank belongs to. When the two have met
+    // on the last blank, either counter closes the chain; front is arbitrary.
+    if (index === progress.solvedFront) {
+      progress.solvedFront += 1;
+    } else {
+      progress.solvedBack += 1;
+    }
+
+    const finished = this.solvedCount(progress) >= this.blankCount(round);
     if (finished) {
       progress.finishedMs = Date.now() - round.startedAt;
     }
@@ -838,7 +916,12 @@ export class RoomStore {
       this.closeRound(room);
     }
     this.touch(room);
-    return { correct: true, solved: progress.solved, finished, word: answer };
+    return {
+      correct: true,
+      solved: this.solvedCount(progress),
+      finished,
+      word: answer,
+    };
   }
 
   /**
@@ -847,24 +930,31 @@ export class RoomStore {
    */
   revealWordHint(
     code: string,
-    playerId: string
-  ): { revealed: string; hintsUsed: number } {
+    playerId: string,
+    index: number
+  ): { index: number; revealed: string; hintsUsed: number } {
     const { room, round, progress } = this.requireWordRound(code, playerId);
     if (progress.finishedMs !== undefined) {
       throw new RoomError("You've already finished the chain.");
     }
-    const answer = round.words[progress.solved + 1];
-    const bought = progress.hints[progress.solved] ?? 0;
+    // Only an open blank can be bought. Otherwise a player could spend hints
+    // reading ahead down the chain instead of solving toward it.
+    if (!this.activeBlanks(round, progress).includes(index)) {
+      throw new RoomError("That word isn't in play right now.");
+    }
+    const answer = round.words[index + 1];
+    const bought = progress.hints[index] ?? 0;
     const shown = freeLetters(answer) + bought;
     // The last letter is never for sale — a hint should narrow the guess, not
     // finish it.
     if (shown >= answer.length - 1) {
       throw new RoomError("No more hints for this word.");
     }
-    progress.hints[progress.solved] = bought + 1;
+    progress.hints[index] = bought + 1;
     progress.hintsUsed += 1;
     this.touch(room);
     return {
+      index,
       revealed: answer.slice(0, shown + 1),
       hintsUsed: progress.hintsUsed,
     };
@@ -878,7 +968,7 @@ export class RoomStore {
     progress: WordChainProgress
   ): number {
     let points =
-      progress.solved * WORD_CHAIN_LINK_POINTS -
+      this.solvedCount(progress) * WORD_CHAIN_LINK_POINTS -
       progress.hintsUsed * WORD_CHAIN_HINT_PENALTY;
     if (progress.finishedMs !== undefined) {
       const remaining = Math.max(
@@ -1290,7 +1380,7 @@ export class RoomStore {
     }
     return {
       playerId,
-      solved: progress.solved,
+      solved: this.solvedCount(progress),
       finished: progress.finishedMs !== undefined,
     };
   }
@@ -1333,11 +1423,11 @@ export class RoomStore {
         const round = room.wordRounds[room.currentRound];
         const blanks = round.words.slice(1, -1);
         const mine = round.progress.get(viewerId);
-        const solved = mine?.solved ?? 0;
 
         if (room.phase === "playing") {
           state.wordRound = {
             puzzleId: round.puzzleId,
+            difficulty: round.difficulty,
             startWord: round.words[0],
             endWord: round.words[round.words.length - 1],
             // The answer for an unsolved blank stays here on the server. What
@@ -1349,9 +1439,9 @@ export class RoomStore {
                 0,
                 freeLetters(word) + (mine?.hints[i] ?? 0)
               ),
-              solvedWord: i < solved ? word : undefined,
+              solvedWord: this.isBlankSolved(round, mine, i) ? word : undefined,
             })),
-            activeIndex: solved,
+            activeIndexes: this.activeBlanks(round, mine),
             endsAt: round.startedAt + round.durationMs,
             finished: mine?.finishedMs !== undefined,
             myPoints: mine ? this.wordChainPoints(round, mine) : 0,
@@ -1360,7 +1450,7 @@ export class RoomStore {
               const p = round.progress.get(id);
               return {
                 playerId: id,
-                solved: p?.solved ?? 0,
+                solved: this.solvedCount(p),
                 finished: p?.finishedMs !== undefined,
               };
             }),
@@ -1370,13 +1460,14 @@ export class RoomStore {
         } else {
           state.wordReveal = {
             puzzleId: round.puzzleId,
+            difficulty: round.difficulty,
             words: round.words,
             results: competitorIds
               .map((id) => {
                 const p = round.progress.get(id);
                 return {
                   playerId: id,
-                  solved: p?.solved ?? 0,
+                  solved: this.solvedCount(p),
                   total: blanks.length,
                   finished: p?.finishedMs !== undefined,
                   timeMs: p?.finishedMs ?? null,

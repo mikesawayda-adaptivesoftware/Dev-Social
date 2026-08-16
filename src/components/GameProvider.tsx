@@ -24,6 +24,7 @@ import type {
   PublicPlayer,
   RoomState,
   RoomVisibility,
+  WordChainDifficultyChoice,
   WordChainGuessResult,
   WordChainStanding,
 } from "@/shared/types";
@@ -63,12 +64,18 @@ interface GameContextValue {
   submitGuess: (choiceId: string) => Promise<void>;
   startGeoGame: (roundDurationSec: number, hostPlaying: boolean) => Promise<void>;
   submitGeoGuess: (lat: number, lng: number) => Promise<void>;
-  startWordChain: (durationSec: number, hostPlaying: boolean) => Promise<void>;
+  startWordChain: (
+    durationSec: number,
+    hostPlaying: boolean,
+    difficulty: WordChainDifficultyChoice
+  ) => Promise<void>;
   submitWordGuess: (
     index: number,
     guess: string
   ) => Promise<WordChainGuessResult>;
-  revealWordHint: () => Promise<{ revealed: string; hintsUsed: number }>;
+  revealWordHint: (
+    index: number
+  ) => Promise<{ index: number; revealed: string; hintsUsed: number }>;
   nextRound: () => Promise<void>;
   playAgain: () => Promise<void>;
 }
@@ -481,11 +488,15 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
   );
 
   const startWordChain = useCallback(
-    (durationSec: number, hostPlaying: boolean) =>
+    (
+      durationSec: number,
+      hostPlaying: boolean,
+      difficulty: WordChainDifficultyChoice
+    ) =>
       new Promise<void>((resolve, reject) => {
         getSocket().emit(
           "host:startWordChain",
-          { durationSec, hostPlaying },
+          { durationSec, hostPlaying, difficulty },
           (res: AckResult<{ ok: true }>) => {
             if (res?.ok) {
               resolve();
@@ -519,18 +530,10 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
   );
 
   const revealWordHint = useCallback(
-    () =>
-      new Promise<{ revealed: string; hintsUsed: number }>(
+    (index: number) =>
+      new Promise<{ index: number; revealed: string; hintsUsed: number }>(
         (resolve, reject) => {
-          const sock = getSocket() as unknown as {
-            emit: (
-              event: "word:hint",
-              ack: (
-                res: AckResult<{ revealed: string; hintsUsed: number }>
-              ) => void
-            ) => void;
-          };
-          sock.emit("word:hint", (res) => {
+          getSocket().emit("word:hint", { index }, (res) => {
             if (res?.ok) {
               resolve(res);
             } else {

@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { useGame } from "@/components/GameProvider";
 import { useCountdown } from "@/lib/useCountdown";
+import { WORD_CHAIN_DIFFICULTY_LABELS } from "@/shared/types";
 import {
   ChainBlankTile,
   ChainColumn,
@@ -10,6 +11,7 @@ import {
   ChainWordTile,
   RaceBoard,
 } from "./ChainBoard";
+import { WordChainBigScreen } from "./WordChainBigScreen";
 
 export function WordChainPlaying() {
   const { state, me, submitWordGuess, revealWordHint } = useGame();
@@ -17,36 +19,51 @@ export function WordChainPlaying() {
   const totalMs = (state?.settings.roundDurationSec ?? 0) * 1000;
   const { secondsLeft, fraction } = useCountdown(word?.endsAt, totalMs);
 
-  const [value, setValue] = useState("");
+  // One draft per blank — two are open at once, and typing in one must not
+  // clobber the other.
+  const [drafts, setDrafts] = useState<Record<number, string>>({});
   const [busy, setBusy] = useState(false);
-  // A wrong answer shakes the tile and leaves a note until the next keystroke.
+  // A wrong answer shakes that tile and leaves a note until the next keystroke.
   // Both clear themselves — the shake on its own animationend, the note on the
   // next edit — so neither needs a timer to tidy up after it.
-  const [wrong, setWrong] = useState(false);
+  const [shakeAt, setShakeAt] = useState<number | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  // Which end the player is working from, so that solving a blank hands focus
+  // to the next one on *that* side instead of jumping across the chain.
+  const [side, setSide] = useState<"front" | "back">("front");
 
   if (!state || !word) {
     return null;
   }
 
-  const total = word.blanks.length;
-  const active = word.blanks[word.activeIndex];
-  const solving = !word.finished && !word.spectating && Boolean(active);
+  // The host running the big screen gets a different screen entirely.
+  if (word.spectating) {
+    return <WordChainBigScreen />;
+  }
 
-  async function submit(e: React.FormEvent) {
+  const total = word.blanks.length;
+  const solved = word.blanks.filter((b) => b.solvedWord).length;
+  const active = word.activeIndexes;
+  const focused = side === "front" ? active[0] : active[active.length - 1];
+
+  async function submit(e: React.FormEvent, index: number) {
     e.preventDefault();
-    const guess = value.trim();
-    if (!guess || busy || !word) {
+    const guess = (drafts[index] ?? "").trim();
+    if (!guess || busy) {
       return;
     }
+    // Remember which end this came from *before* awaiting: on success the
+    // frontier moves, this input unmounts and the next one autofocuses, and it
+    // should be the one on the end the player is actually working from.
+    setSide(index === active[0] ? "front" : "back");
     setBusy(true);
     try {
-      const res = await submitWordGuess(word.activeIndex, guess);
+      const res = await submitWordGuess(index, guess);
       if (res.correct) {
-        setValue("");
+        setDrafts((d) => ({ ...d, [index]: "" }));
         setNote(null);
       } else {
-        setWrong(true);
+        setShakeAt(index);
         setNote(`${guess.toUpperCase()} isn't it — try another word.`);
       }
     } catch (err) {
@@ -56,9 +73,9 @@ export function WordChainPlaying() {
     }
   }
 
-  async function hint() {
+  async function hint(index: number) {
     try {
-      await revealWordHint();
+      await revealWordHint(index);
       setNote(null);
     } catch (err) {
       setNote(err instanceof Error ? err.message : "No hint available.");
@@ -73,7 +90,10 @@ export function WordChainPlaying() {
       {/* Clock + banked points */}
       <div className="flex items-center justify-between text-sm">
         <span className="rounded-full bg-white/10 px-3 py-1 font-semibold">
-          🔗 {word.activeIndex}/{total} links
+          🔗 {solved}/{total}
+          <span className="ml-1.5 text-xs font-medium text-white/40">
+            {WORD_CHAIN_DIFFICULTY_LABELS[word.difficulty]}
+          </span>
         </span>
         <span className="font-mono font-bold text-fuchsia-300">
           {word.myPoints.toLocaleString()} pts
@@ -94,10 +114,8 @@ export function WordChainPlaying() {
 
       <p className="mt-4 text-center text-xs text-white/45">
         Every neighbouring pair makes a word — like{" "}
-        <span className="font-semibold text-white/70">
-          SUN·FLOWER·BED
-        </span>
-        . Fill the chain top to bottom.
+        <span className="font-semibold text-white/70">SUN·FLOWER·BED</span>. Work
+        in from either end.
       </p>
 
       {/* The chain */}
@@ -105,7 +123,7 @@ export function WordChainPlaying() {
         <ChainColumn>
           <ChainWordTile word={word.startWord} tone="given" />
           {word.blanks.map((blank, i) => {
-            const isActive = solving && i === word.activeIndex;
+            const isActive = !word.finished && active.includes(i);
             return (
               <div key={i}>
                 <ChainLink />
@@ -113,11 +131,11 @@ export function WordChainPlaying() {
                   <ChainWordTile word={blank.solvedWord} tone="solved" />
                 ) : isActive ? (
                   <form
-                    onSubmit={submit}
+                    onSubmit={(e) => submit(e, i)}
                     className={`rounded-xl border-2 border-fuchsia-400 bg-fuchsia-400/10 p-2 ${
-                      wrong ? "animate-shake" : ""
+                      shakeAt === i ? "animate-shake" : ""
                     }`}
-                    onAnimationEnd={() => setWrong(false)}
+                    onAnimationEnd={() => setShakeAt(null)}
                   >
                     <div className="mb-1.5 text-center font-mono text-sm font-black tracking-[0.3em]">
                       <span className="text-fuchsia-300">{blank.revealed}</span>
@@ -128,13 +146,25 @@ export function WordChainPlaying() {
                       </span>
                     </div>
                     <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => hint(i)}
+                        title="Reveal a letter (−100 pts)"
+                        aria-label="Reveal a letter, costs 100 points"
+                        className="shrink-0 rounded-lg border border-white/15 bg-white/5 px-2 text-sm hover:bg-white/10"
+                      >
+                        💡
+                      </button>
                       <input
-                        // It's a race, and this input is the only thing on the
-                        // screen to interact with — the keyboard should be up.
-                        autoFocus
-                        value={value}
+                        // Focus follows the end the player is working from, so
+                        // solving a blank continues the run instead of hopping.
+                        autoFocus={i === focused}
+                        value={drafts[i] ?? ""}
+                        onFocus={() =>
+                          setSide(i === active[0] ? "front" : "back")
+                        }
                         onChange={(e) => {
-                          setValue(e.target.value);
+                          setDrafts((d) => ({ ...d, [i]: e.target.value }));
                           setNote(null);
                         }}
                         maxLength={blank.length}
@@ -148,7 +178,7 @@ export function WordChainPlaying() {
                       />
                       <button
                         type="submit"
-                        disabled={busy || !value.trim()}
+                        disabled={busy || !(drafts[i] ?? "").trim()}
                         className="shrink-0 rounded-lg bg-fuchsia-500 px-4 font-bold text-white hover:bg-fuchsia-400 disabled:opacity-40"
                       >
                         →
@@ -172,17 +202,11 @@ export function WordChainPlaying() {
         {note && (
           <p className="mt-3 text-center text-sm text-amber-300">{note}</p>
         )}
-
-        {solving && (
-          <button
-            onClick={hint}
-            className="mt-3 w-full rounded-xl border border-white/15 bg-white/5 py-2 text-sm font-semibold text-white/70 hover:bg-white/10"
-          >
-            💡 Reveal a letter{" "}
-            <span className="text-white/40">
-              (−100 pts{word.hintsUsed > 0 ? ` · ${word.hintsUsed} used` : ""})
-            </span>
-          </button>
+        {!word.finished && (
+          <p className="mt-3 text-center text-xs text-white/35">
+            💡 reveals a letter for −100 pts
+            {word.hintsUsed > 0 && ` · ${word.hintsUsed} used`}
+          </p>
         )}
       </div>
 
@@ -200,13 +224,6 @@ export function WordChainPlaying() {
             out.
           </p>
         </div>
-      )}
-
-      {word.spectating && (
-        <p className="mt-4 text-center text-sm text-white/50">
-          You&rsquo;re running the big screen — everyone else is solving on their
-          phones.
-        </p>
       )}
 
       <div className="card mt-4 p-4">

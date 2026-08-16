@@ -156,6 +156,33 @@ export interface GeoRevealView {
 // only its length and the letters that particular viewer has unlocked, and the
 // whole chain appears only at the reveal.
 
+/**
+ * How hard a chain's blanks are to pin down. Measured as how much narrowing the
+ * free first letter has to do: on an easy chain the length alone identifies the
+ * answer, on a hard one several words fit the shape.
+ */
+export type WordChainDifficulty = "easy" | "normal" | "hard";
+
+/** The host's lobby choice — a tier, or let the server pick from all of them. */
+export type WordChainDifficultyChoice = WordChainDifficulty | "any";
+
+export const WORD_CHAIN_DIFFICULTY_CHOICES = [
+  "any",
+  "easy",
+  "normal",
+  "hard",
+] as const satisfies readonly WordChainDifficultyChoice[];
+
+export const WORD_CHAIN_DIFFICULTY_LABELS: Record<
+  WordChainDifficultyChoice,
+  string
+> = {
+  any: "Any",
+  easy: "Easy",
+  normal: "Normal",
+  hard: "Hard",
+};
+
 /** One blank in the chain, as a single viewer currently sees it. */
 export interface WordChainBlank {
   /** Letters in the answer, so the client can draw the right number of slots. */
@@ -181,11 +208,16 @@ export interface WordChainStanding {
 
 export interface WordChainRoundView {
   puzzleId: string;
+  difficulty: WordChainDifficulty;
   startWord: string;
   endWord: string;
   blanks: WordChainBlank[];
-  /** The blank this viewer answers next; equals `blanks.length` once done. */
-  activeIndex: number;
+  /**
+   * The blanks this viewer may answer right now. The chain is solved from both
+   * ends inwards, so there are normally two — the frontier from the top and the
+   * one from the bottom — collapsing to one when they meet, and none once done.
+   */
+  activeIndexes: number[];
   endsAt: number; // epoch ms when the puzzle auto-closes
   /** This viewer finished the chain and is now waiting on everyone else. */
   finished: boolean;
@@ -211,6 +243,7 @@ export interface WordChainResult {
 
 export interface WordChainRevealView {
   puzzleId: string;
+  difficulty: WordChainDifficulty;
   /** The full chain, answers included. Only ever sent once the round is over. */
   words: string[];
   results: WordChainResult[];
@@ -339,19 +372,26 @@ export interface ClientToServerEvents {
     ack?: (res: AckResult<{ ok: true }>) => void
   ) => void;
   "host:startWordChain": (
-    payload: { durationSec: number; hostPlaying: boolean },
+    payload: {
+      durationSec: number;
+      hostPlaying: boolean;
+      difficulty: WordChainDifficultyChoice;
+    },
     ack?: (res: AckResult<{ ok: true }>) => void
   ) => void;
-  // Answer one blank in the chain. `index` guards against a stale client
-  // answering a blank it has already moved past.
+  // Answer one blank in the chain. `index` says which — two are open at once —
+  // and guards against a stale client answering one it has already moved past.
   "word:guess": (
     payload: { index: number; guess: string },
     ack?: (res: AckResult<WordChainGuessResult>) => void
   ) => void;
-  // Buy one more letter of the current blank, for a points penalty. Private to
-  // the buyer — nobody else's view changes.
+  // Buy one more letter of an open blank, for a points penalty. Private to the
+  // buyer — nobody else's view changes.
   "word:hint": (
-    ack?: (res: AckResult<{ revealed: string; hintsUsed: number }>) => void
+    payload: { index: number },
+    ack?: (
+      res: AckResult<{ index: number; revealed: string; hintsUsed: number }>
+    ) => void
   ) => void;
   "host:nextRound": (ack?: (res: AckResult<{ ok: true }>) => void) => void;
   "host:playAgain": (ack?: (res: AckResult<{ ok: true }>) => void) => void;

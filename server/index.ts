@@ -331,14 +331,20 @@ io.on("connection", (socket) => {
   socket.on("geo:guess", ({ lat, lng }, ack) =>
     withGuess((code, pid) => store.submitGeoGuess(code, pid, lat, lng), ack)
   );
-  socket.on("host:startWordChain", async ({ durationSec, hostPlaying }, ack) => {
+  socket.on("host:startWordChain", async (payload, ack) => {
     const { code, playerId } = socket.data;
     if (!code || !playerId) {
       ack?.({ ok: false, error: "You are not in a room." });
       return;
     }
     try {
-      await store.startWordChainGame(code, playerId, durationSec, hostPlaying);
+      await store.startWordChainGame(
+        code,
+        playerId,
+        payload.durationSec,
+        payload.hostPlaying,
+        payload.difficulty
+      );
       ack?.(ok({ ok: true as const }));
       broadcastRoom(code);
     } catch (err) {
@@ -377,7 +383,7 @@ io.on("connection", (socket) => {
       ack?.(fail(err) as never);
     }
   });
-  socket.on("word:hint", (ack) => {
+  socket.on("word:hint", ({ index }, ack) => {
     const { code, playerId } = socket.data;
     if (!code || !playerId) {
       ack?.({ ok: false, error: "You are not in a room." });
@@ -386,7 +392,7 @@ io.on("connection", (socket) => {
     try {
       // A hint is private: it moves one player's letters and one player's
       // score, so only they hear about it.
-      const result = store.revealWordHint(code, playerId);
+      const result = store.revealWordHint(code, playerId, index);
       ack?.(ok(result));
       sendSnapshot(code, playerId, socket.id);
     } catch (err) {
