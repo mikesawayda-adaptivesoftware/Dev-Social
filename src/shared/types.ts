@@ -4,11 +4,20 @@
 export type GamePhase =
   | "lobby"
   | "submission"
+  // Draw It only: the drawer is choosing which of three words to draw, and
+  // everyone else is waiting on them. Its own phase rather than a flag on
+  // `playing`, because nothing is drawable or guessable yet and the round clock
+  // hasn't started.
+  | "picking"
   | "playing"
   | "reveal"
   | "final";
 
-export type GameType = "photo_guessr" | "geo_guessr" | "word_chain";
+export type GameType =
+  | "photo_guessr"
+  | "geo_guessr"
+  | "word_chain"
+  | "draw_it";
 
 // Whether a room is discoverable in the public games browser. Private rooms are
 // reachable only by their code / join link, which is the historical behaviour.
@@ -20,18 +29,21 @@ export const GAME_TYPE_LABELS: Record<GameType, string> = {
   photo_guessr: "Photo Guessr",
   geo_guessr: "Real GeoGuessr",
   word_chain: "Word Chain",
+  draw_it: "Draw It",
 };
 
 export const GAME_TYPE_EMOJI: Record<GameType, string> = {
   photo_guessr: "📸",
   geo_guessr: "🗺️",
   word_chain: "🔗",
+  draw_it: "✏️",
 };
 
 export const GAME_TYPE_BLURB: Record<GameType, string> = {
   photo_guessr: "Match everyone's photos to the right teammate.",
   geo_guessr: "Explore Street View and pin the location on a map.",
   word_chain: "Race to fill the missing links between two words.",
+  draw_it: "One person draws, everyone else races to guess it.",
 };
 
 /** Whether a string is a game type we know about (enabled or not). */
@@ -53,6 +65,7 @@ export function isKnownGameType(value: string): value is GameType {
 export const ENABLED_GAME_TYPES = [
   "geo_guessr",
   "word_chain",
+  "draw_it",
 ] as const satisfies readonly GameType[];
 
 /** What a fresh lobby opens on. Must be an enabled game. */
@@ -260,6 +273,125 @@ export interface WordChainGuessResult {
   word?: string;
 }
 
+// ---- Draw It ----
+//
+// One player draws a secret word; everyone else types guesses against the clock.
+// The drawer's strokes stream to every screen as they happen.
+//
+// The whole game hangs on one asymmetry: the drawer knows the word and nobody
+// else may, not even after someone solves it — a correct guess is announced as
+// "Ada got it", never as the word, or the first solver would end the round for
+// the room. That's why the round view is built per viewer, like every other
+// game's answer here.
+
+export type DrawDifficulty = "easy" | "normal" | "hard";
+export type DrawDifficultyChoice = DrawDifficulty | "any";
+
+export const DRAW_DIFFICULTY_CHOICES = [
+  "any",
+  "easy",
+  "normal",
+  "hard",
+] as const satisfies readonly DrawDifficultyChoice[];
+
+/** Ink the drawer can pick. The app's avatar palette, reused as a paint box. */
+export const DRAW_COLORS = [
+  "#f5f3ff", // chalk — the default, near-white on the dark canvas
+  "#f87171",
+  "#fb923c",
+  "#facc15",
+  "#4ade80",
+  "#22d3ee",
+  "#60a5fa",
+  "#f472b6",
+] as const;
+
+/** Brush widths, in canvas units (see DRAW_CANVAS_UNITS). */
+export const DRAW_WIDTHS = [6, 18] as const;
+
+/**
+ * Strokes are stored in a square coordinate space of this many units rather
+ * than in pixels, so a drawing made on a phone renders correctly on a TV. Every
+ * client scales the same numbers to whatever canvas it has.
+ */
+export const DRAW_CANVAS_UNITS = 1000;
+
+/** How long the drawer gets to choose from their three words. */
+export const DRAW_PICK_SECONDS = 15;
+
+// Per-round drawing time the host may pick in the lobby.
+export const DRAW_DURATION_OPTIONS_SEC = [60, 90, 120] as const;
+export const DRAW_DEFAULT_DURATION_SEC = 90;
+
+/** Most drawers in one game, however many people are in the room. */
+export const DRAW_MAX_ROUNDS = 8;
+
+export interface DrawStroke {
+  /** Index into DRAW_COLORS. */
+  color: number;
+  /** Index into DRAW_WIDTHS. */
+  width: number;
+  /** Flat [x0, y0, x1, y1, …] in DRAW_CANVAS_UNITS space. */
+  points: number[];
+}
+
+export interface DrawChatLine {
+  id: string;
+  playerId: string;
+  /** A wrong guess, verbatim. Empty when `solved` — the word is never sent. */
+  text: string;
+  solved: boolean;
+}
+
+export interface DrawRoundView {
+  index: number; // 0-based round
+  total: number;
+  drawerId: string;
+  iAmDrawer: boolean;
+  /** The word itself — only ever present for the drawer. */
+  word?: string;
+  /** What everyone else sees: letters as underscores, spaces preserved. */
+  wordMask: string;
+  /** The three options, during `picking`, and only for the drawer. */
+  wordChoices?: string[];
+  /** When the current phase ends — the pick deadline, then the round clock. */
+  endsAt: number;
+  strokes: DrawStroke[];
+  chat: DrawChatLine[];
+  iGuessed: boolean;
+  /** How many of the guessers have it, and how many there are. */
+  solvedCount: number;
+  guessCount: number;
+  myPoints: number;
+  spectating: boolean;
+  isHost: boolean;
+}
+
+export interface DrawResult {
+  playerId: string;
+  correct: boolean;
+  /** ms from round start to a correct guess; null if they never got it. */
+  timeMs: number | null;
+  points: number;
+}
+
+export interface DrawRevealView {
+  index: number;
+  total: number;
+  drawerId: string;
+  /** Safe to send now — the round is over. */
+  word: string;
+  strokes: DrawStroke[];
+  results: DrawResult[];
+  drawerPoints: number;
+}
+
+/** Ack for a submitted guess. Never carries the word, right or wrong. */
+export interface DrawGuessResult {
+  correct: boolean;
+  points: number;
+}
+
 /**
  * A room as it appears in the public games browser. Deliberately minimal — this
  * goes to anyone on the site, including people not in the room.
@@ -290,6 +422,8 @@ export interface RoomState {
   geoReveal?: GeoRevealView;
   wordRound?: WordChainRoundView;
   wordReveal?: WordChainRevealView;
+  drawRound?: DrawRoundView;
+  drawReveal?: DrawRevealView;
   final?: { ranking: { playerId: string; score: number }[] };
 }
 
@@ -418,6 +552,36 @@ export interface ClientToServerEvents {
       res: AckResult<{ index: number; revealed: string; hintsUsed: number }>
     ) => void
   ) => void;
+  "host:startDrawIt": (
+    payload: {
+      roundDurationSec: number;
+      hostPlaying: boolean;
+      difficulty: DrawDifficultyChoice;
+    },
+    ack?: (res: AckResult<{ ok: true }>) => void
+  ) => void;
+  // Drawer-only, during `picking`.
+  "draw:pickWord": (
+    payload: { word: string },
+    ack?: (res: AckResult<{ ok: true }>) => void
+  ) => void;
+  // Drawer-only. A batch of finished strokes, appended to the canvas. Batched
+  // rather than per-point so a fast scribble is a few messages, not hundreds.
+  "draw:ink": (
+    payload: { strokes: DrawStroke[] },
+    ack?: (res: AckResult<{ ok: true }>) => void
+  ) => void;
+  // Drawer-only. Both resend the authoritative canvas rather than asking every
+  // client to replay the same edit — they're rare, and the whole canvas is
+  // smaller than a thumbnail.
+  "draw:undo": (ack?: (res: AckResult<{ ok: true }>) => void) => void;
+  "draw:clear": (ack?: (res: AckResult<{ ok: true }>) => void) => void;
+  // A guess. Wrong ones go to the room as chat; a right one is announced
+  // without the word.
+  "draw:guess": (
+    payload: { text: string },
+    ack?: (res: AckResult<DrawGuessResult>) => void
+  ) => void;
   "host:nextRound": (ack?: (res: AckResult<{ ok: true }>) => void) => void;
   "host:playAgain": (ack?: (res: AckResult<{ ok: true }>) => void) => void;
 }
@@ -454,6 +618,16 @@ export interface ServerToClientEvents {
   // room needs the race board, but only one player's position changed, so this
   // is a single standing rather than a fresh snapshot each.
   "chain:standing": (payload: WordChainStanding) => void;
+  // New strokes, appended to whatever the client already has. The hot path of
+  // Draw It, and the reason strokes are batched: this fires several times a
+  // second while someone is drawing.
+  "draw:ink": (payload: { strokes: DrawStroke[] }) => void;
+  // The authoritative canvas, after an undo or a clear. Rare enough to send
+  // whole rather than teaching every client to replay the edit.
+  "draw:canvas": (payload: { strokes: DrawStroke[] }) => void;
+  // One line of guess chat, plus the solved counter so the header can move
+  // without waiting for a snapshot.
+  "draw:chat": (payload: { line: DrawChatLine; solvedCount: number }) => void;
   // Pushed to subscribers of the public games browser whenever the list changes.
   "rooms:list": (rooms: PublicRoomSummary[]) => void;
 }

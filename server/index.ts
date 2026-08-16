@@ -402,6 +402,101 @@ io.on("connection", (socket) => {
       ack?.(fail(err) as never);
     }
   });
+  socket.on("host:startDrawIt", async (payload, ack) => {
+    const { code, playerId } = socket.data;
+    if (!code || !playerId) {
+      ack?.({ ok: false, error: "You are not in a room." });
+      return;
+    }
+    try {
+      await store.startDrawItGame(
+        code,
+        playerId,
+        payload.roundDurationSec,
+        payload.hostPlaying,
+        payload.difficulty
+      );
+      ack?.(ok({ ok: true as const }));
+      broadcastRoom(code);
+    } catch (err) {
+      ack?.(fail(err) as never);
+    }
+  });
+  socket.on("draw:pickWord", ({ word }, ack) =>
+    withRoom((code, pid) => store.pickDrawWord(code, pid, word), ack)
+  );
+  /**
+   * The hot path. Strokes go straight back out to the room and nowhere else —
+   * no snapshot, because the roster hasn't changed and a snapshot per brush
+   * stroke would be the whole scaling problem the delta events exist to avoid.
+   *
+   * The drawer is excluded: they already drew it locally, and echoing it back
+   * would fight their own canvas.
+   */
+  socket.on("draw:ink", ({ strokes }, ack) => {
+    const { code, playerId } = socket.data;
+    if (!code || !playerId) {
+      ack?.({ ok: false, error: "You are not in a room." });
+      return;
+    }
+    try {
+      store.appendDrawStrokes(code, playerId, strokes);
+      ack?.(ok({ ok: true as const }));
+      socket.to(code).emit("draw:ink", { strokes });
+    } catch (err) {
+      ack?.(fail(err) as never);
+    }
+  });
+  const canvasEdit = (
+    action: "undo" | "clear",
+    ack?: (res: AckResult<{ ok: true }>) => void
+  ) => {
+    const { code, playerId } = socket.data;
+    if (!code || !playerId) {
+      ack?.({ ok: false, error: "You are not in a room." });
+      return;
+    }
+    try {
+      const strokes = store.editDrawCanvas(code, playerId, action);
+      ack?.(ok({ ok: true as const }));
+      // The whole canvas, so no client has to replay the edit to agree.
+      socket.to(code).emit("draw:canvas", { strokes });
+    } catch (err) {
+      ack?.(fail(err) as never);
+    }
+  };
+  socket.on("draw:undo", (ack) => canvasEdit("undo", ack));
+  socket.on("draw:clear", (ack) => canvasEdit("clear", ack));
+  /**
+   * A guess. Wrong ones become chat for the whole room; a right one becomes a
+   * chat line with no text in it, which is what keeps the word off every screen
+   * but the drawer's. If it closed the round, that's a phase change and
+   * everyone needs a snapshot instead.
+   */
+  socket.on("draw:guess", ({ text }, ack) => {
+    const { code, playerId } = socket.data;
+    if (!code || !playerId) {
+      ack?.({ ok: false, error: "You are not in a room." });
+      return;
+    }
+    try {
+      const phaseBefore = store.getRoom(code)?.phase;
+      const { result, line } = store.submitDrawGuess(code, playerId, text);
+      ack?.(ok(result));
+      if (store.getRoom(code)?.phase !== phaseBefore) {
+        broadcastRoom(code);
+        return;
+      }
+      if (line) {
+        io.to(code).emit("draw:chat", {
+          line,
+          solvedCount: store.drawSolvedCount(code),
+        });
+      }
+    } catch (err) {
+      ack?.(fail(err) as never);
+    }
+  });
   socket.on("host:nextRound", (ack) =>
     withRoom((code, pid) => store.nextRound(code, pid), ack)
   );
