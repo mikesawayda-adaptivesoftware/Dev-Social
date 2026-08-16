@@ -111,8 +111,14 @@ phones using your machine's network URL (printed by Next as `Network:`), e.g.
 > chains *nobody in the room* has played, and only falls back to least-seen once
 > that group has collectively played the entire bank. History lives in the
 > `player_word_chains_seen` table, so this needs Supabase configured — in local
-> mode the pick is simply random. Grow the bank by adding entries to
-> `server/wordChains.ts`.
+> mode the pick is simply random.
+>
+> The bank ships **500 chains**. To grow it, add links to the `LINKS` table in
+> `scripts/generateWordChains.mjs` and re-run it — the chains are walked out of
+> that graph, so a link that isn't a real compound is the one bug that matters
+> here and the table is the only thing worth reviewing. Existing chains and
+> their ids are always kept; the history table is keyed by id, so renumbering
+> one re-deals it to players who already solved it.
 
 ## Google Maps setup (for Real GeoGuessr)
 
@@ -193,11 +199,12 @@ server/
   index.ts                # Socket.IO server: wires events -> RoomStore
   rooms.ts                # RoomStore: in-memory rooms + game state machines
   geoLocations.ts         # Curated GeoGuessr pool + panorama resolver
-  wordChains.ts           # Seeded Word Chain puzzle bank + answer normalizing
+  wordChains.ts           # Seeded Word Chain puzzle bank (generated) + normalizing
 scripts/
   smoke.mjs, smoke2.mjs   # End-to-end socket tests (node scripts/smoke.mjs)
   smokeGeo.mjs            # GeoGuessr socket flow test
   smokeWordChain.mjs      # Word Chain socket flow test
+  generateWordChains.mjs  # Walk the vetted link graph to grow the puzzle bank
   resolvePanos.ts         # Bake Street View panorama ids into the pool
 ```
 
@@ -607,6 +614,7 @@ server {
 | `node scripts/smoke2.mjs` | Deterministic scoring test              |
 | `node scripts/smokeGeo.mjs` | Real GeoGuessr socket flow test (skips without a Maps key) |
 | `node scripts/smokeWordChain.mjs` | Word Chain socket flow test (no keys needed) |
+| `node scripts/generateWordChains.mjs [n]` | Grow the Word Chain bank to n puzzles (default 500) |
 | `npx tsx scripts/resolvePanos.ts` | Bake Street View panorama ids into the pool |
 | `npm run lint`     | ESLint (also the first CI gate)                |
 | `npx tsc --noEmit` | Typecheck, **including `server/`** — run after `npm run build` |
