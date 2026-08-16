@@ -343,7 +343,8 @@ io.on("connection", (socket) => {
         playerId,
         payload.durationSec,
         payload.hostPlaying,
-        payload.difficulty
+        payload.difficulty,
+        payload.length
       );
       ack?.(ok({ ok: true as const }));
       broadcastRoom(code);

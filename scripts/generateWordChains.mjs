@@ -24,11 +24,16 @@ import { dirname, join } from "node:path";
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const BANK = join(ROOT, "server", "wordChains.ts");
 
-const TARGET = Number(process.argv[2] ?? 500);
-const CHAIN_LENGTH = 6; // 4 blanks, so every puzzle scores out of the same total
+// Per length, not in total: each is its own pool, because a host who picks
+// "long" should get the same never-repeat runway as one who picks "short".
+const TARGET_PER_LENGTH = Number(process.argv[2] ?? 400);
+// Chain lengths the host can choose between, in words. Blanks are two fewer,
+// so these are 3, 4 and 6 links. Scoring is normalised per blank (see
+// server/rooms.ts), so a short chain is worth exactly as much as a long one.
+const CHAIN_LENGTHS = [5, 6, 8];
 // How many chains may reuse one link. Low enough that no one link becomes a
 // motif across the bank, high enough to reach the target from this many links.
-const MAX_LINK_USES = 12;
+const MAX_LINK_USES = 24;
 // …and how many links two chains may have in common. The cap above bounds how
 // often a link appears but not how much any *pair* of chains overlaps: two
 // puzzles sharing 4 of their 5 links are the same puzzle wearing a hat, and
@@ -547,24 +552,34 @@ function blankEffort(words, i) {
   );
 }
 
-/** A chain's difficulty score: the effort of its blanks, added up. */
+/**
+ * A chain's difficulty: the average effort of its blanks.
+ *
+ * An average rather than a total, because chains come in several lengths now
+ * and a six-blank chain would otherwise score as "hard" purely for being long.
+ * What the tier should say is how hard the blanks are, not how many there are.
+ */
 function chainEffort(words) {
   let total = 0;
   for (let i = 1; i < words.length - 1; i++) {
     total += blankEffort(words, i);
   }
-  return total;
+  return total / (words.length - 2);
 }
 
 // Cut points from the score distribution across the bank, which is skewed low:
-// they split it near evenly rather than into equal score ranges.
+// they split it near evenly rather than into equal score ranges. Recompute them
+// if the length mix or the link graph changes much — they're the 33rd and 67th
+// percentiles of the actual spread, not round numbers.
 //
 // Honest about what this measures: how much narrowing the free letter has to do
 // inside *our* link graph, not how obscure the compound is in English. A blank
 // the graph pins by length alone can still need a word you'd not have thought
 // of. It's a good knob, not a promise.
-const EASY_AT_MOST = 5;
-const NORMAL_AT_MOST = 7;
+// Cut points sit just above 4/3 and 7/4 so the common exact fractions land on
+// the intended side rather than on a floating-point coin toss.
+const EASY_AT_MOST = 1.34;
+const NORMAL_AT_MOST = 1.76;
 
 function difficultyOf(words) {
   const effort = chainEffort(words);
@@ -697,13 +712,13 @@ existing.forEach((chain, i) => {
 
 // --- Path search ---------------------------------------------------------
 
-/** Depth-first walk for one chain starting at `start`, or null. */
-function findChain(start) {
+/** Depth-first walk for one chain of `length` starting at `start`, or null. */
+function findChain(start, length) {
   const path = [start];
   const taken = [];
 
   function step() {
-    if (path.length === CHAIN_LENGTH) {
+    if (path.length === length) {
       return (
         !seenChains.has(path.join(" ")) && wellPosed(path) && !tooSimilar(path)
       );
@@ -752,24 +767,31 @@ function makeId(words) {
 // Round-robin over start words rather than draining one hub at a time, so the
 // bank doesn't open with fifty chains that all begin with FIRE.
 const starts = shuffled([...adjacency.keys()]);
-let exhausted = 0;
+const countAtLength = (length) =>
+  chains.filter((c) => c.words.length === length).length;
 
-while (chains.length < TARGET && exhausted < starts.length) {
-  exhausted = 0;
-  for (const start of starts) {
-    if (chains.length >= TARGET) {
-      break;
+// Longest first. Long chains are the scarce ones — they need more consecutive
+// well-posed links — so they get first call on the link budget rather than
+// picking through what the short ones left behind.
+for (const length of [...CHAIN_LENGTHS].sort((a, b) => b - a)) {
+  let exhausted = 0;
+  while (countAtLength(length) < TARGET_PER_LENGTH && exhausted < starts.length) {
+    exhausted = 0;
+    for (const start of starts) {
+      if (countAtLength(length) >= TARGET_PER_LENGTH) {
+        break;
+      }
+      const words = findChain(start, length);
+      if (!words) {
+        exhausted++;
+        continue;
+      }
+      const id = makeId(words);
+      usedIds.add(id);
+      seenChains.add(words.join(" "));
+      indexChain(words, chains.length);
+      chains.push({ id, words });
     }
-    const words = findChain(start);
-    if (!words) {
-      exhausted++;
-      continue;
-    }
-    const id = makeId(words);
-    usedIds.add(id);
-    seenChains.add(words.join(" "));
-    indexChain(words, chains.length);
-    chains.push({ id, words });
   }
 }
 
@@ -786,8 +808,10 @@ for (const { id, words } of chains) {
     problems.push(`duplicate id ${id}`);
   }
   ids.add(id);
-  if (words.length !== CHAIN_LENGTH) {
-    problems.push(`${id}: ${words.length} words, expected ${CHAIN_LENGTH}`);
+  if (!CHAIN_LENGTHS.includes(words.length)) {
+    problems.push(
+      `${id}: ${words.length} words, expected one of ${CHAIN_LENGTHS.join("/")}`
+    );
   }
   if (new Set(words).size !== words.length) {
     problems.push(`${id}: repeats a word`);
@@ -871,9 +895,13 @@ const tiers = chains.reduce((counts, c) => {
   counts[tier] = (counts[tier] ?? 0) + 1;
   return counts;
 }, {});
+const byLength = CHAIN_LENGTHS.map(
+  (n) => `${countAtLength(n)} of ${n} words`
+).join(", ");
 console.log(
   `${chains.length} chains (${existing.length} kept, ${added} added` +
     `${dropped.length ? `, ${dropped.length} dropped as ambiguous` : ""})\n` +
+    `lengths: ${byLength}\n` +
     `${distinctStarts} distinct opening words, ${distinctWords} distinct words used\n` +
     `${linksInPlay} of ${linkTotal} links in play, at most ${MAX_LINK_USES} uses ` +
     `each and at most ${MAX_SHARED_LINKS} shared between any two chains\n` +
@@ -881,9 +909,13 @@ console.log(
       tiers.hard ?? 0
     } hard`
 );
-if (chains.length < TARGET) {
+const short = CHAIN_LENGTHS.filter(
+  (n) => countAtLength(n) < TARGET_PER_LENGTH
+);
+if (short.length) {
   console.log(
-    `\nShort of ${TARGET}. The graph is spent at this reuse cap — add links to ` +
-      `LINKS, or raise MAX_LINK_USES and accept more overlap between puzzles.`
+    `\nShort of ${TARGET_PER_LENGTH} at ${short.join("/")} words. The graph is ` +
+      `spent at this reuse cap — add links to LINKS, or raise MAX_LINK_USES ` +
+      `and accept more overlap between puzzles.`
   );
 }

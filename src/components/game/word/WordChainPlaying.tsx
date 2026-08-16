@@ -149,8 +149,8 @@ export function WordChainPlaying() {
                       <button
                         type="button"
                         onClick={() => hint(i)}
-                        title="Reveal a letter (−100 pts)"
-                        aria-label="Reveal a letter, costs 100 points"
+                        title={`Reveal a letter (−${word.hintCost} pts)`}
+                        aria-label={`Reveal a letter, costs ${word.hintCost} points`}
                         className="shrink-0 rounded-lg border border-white/15 bg-white/5 px-2 text-sm hover:bg-white/10"
                       >
                         💡
@@ -204,7 +204,7 @@ export function WordChainPlaying() {
         )}
         {!word.finished && (
           <p className="mt-3 text-center text-xs text-white/35">
-            💡 reveals a letter for −100 pts
+            💡 reveals a letter for −{word.hintCost} pts
             {word.hintsUsed > 0 && ` · ${word.hintsUsed} used`}
           </p>
         )}

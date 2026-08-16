@@ -89,22 +89,26 @@ phones using your machine's network URL (printed by Next as `Network:`), e.g.
 ## How to play (Word Chain)
 
 1. **Host** creates a room and, in the lobby, picks **Word Chain**, the time
-   limit (**1 / 2 / 5 minutes**) and the **difficulty** (Any / Easy / Normal /
-   Hard). "I'm playing too" is on by default here.
+   limit (**1 / 2 / 5 minutes**), the **chain length** (Short / Standard / Long
+   — 3, 4 or 6 blanks) and the **difficulty** (Any / Easy / Normal / Hard).
+   "I'm playing too" is on by default here.
 2. Everyone **joins** from their phone with the code + their name. One player is
    fine — you're racing the clock either way (see the solo note above).
 3. Host starts → everyone gets **the same chain** at the same time: two words
-   given, four blanks between them. Each neighbouring pair makes a compound word
-   or set phrase, so `KEY · ? · ? · ? · ? · PUNCH` resolves to
+   given, the blanks between them to fill. Each neighbouring pair makes a
+   compound word or set phrase, so `KEY · ? · ? · ? · ? · PUNCH` resolves to
    KEY**NOTE**, NOTE**BOOK**, BOOK**WORM**, WORM**HOLE**, HOLE PUNCH.
 4. Solve **inwards from both ends** — there's an input at the top frontier and
    one at the bottom, so a link you can't get stops you one way round rather
    than stopping you dead. Each blank shows its length and its first letter;
    **💡 Reveal a letter** buys one more for −100 points. Wrong answers cost
    nothing but time.
-5. **500 points per link**, plus **1,000** for completing the chain and up to
-   **2,000** more for the time you had left — a clean sweep tops out at 5,000,
-   the same ceiling as a perfect GeoGuessr round.
+5. **2,000 points split across the blanks**, plus **1,000** for completing the
+   chain and up to **2,000** more for the time you had left — a clean sweep tops
+   out at 5,000, the same ceiling as a perfect GeoGuessr round. The solve points
+   are a fixed pot rather than a rate per link, so **every length is worth the
+   same** and the leaderboard rewards playing well rather than picking "long".
+   A hint costs a fifth of a link, which is 100 points on a standard chain.
 6. Finish early and you **wait on the others**, watching the live race board.
    The round ends when everyone finishes or the clock runs out, then **Reveal**
    shows the whole chain and everyone's times, and **Final** crowns a champion.
@@ -129,7 +133,12 @@ phones using your machine's network URL (printed by Next as `Network:`), e.g.
 > `player_word_chains_seen` table, so this needs Supabase configured — in local
 > mode the pick is simply random.
 >
-> The bank ships **500 chains**. To grow it, add links to the `LINKS` table in
+> The bank ships **1,051 chains** — 400 short, 500 standard, 151 long. Long
+> chains are the scarce ones: every blank has to be unambiguous from both sides
+> (below), and six in a row is a much harder ask of the graph than three. Each
+> length is its own never-repeat pool, so the pools are independent.
+>
+> To grow it, add links to the `LINKS` table in
 > `scripts/generateWordChains.mjs` and re-run it — the chains are walked out of
 > that graph, so a link that isn't a real compound is the one bug that matters
 > here and the table is the only thing worth reviewing.
@@ -641,7 +650,7 @@ server {
 | `node scripts/smoke2.mjs` | Deterministic scoring test              |
 | `node scripts/smokeGeo.mjs` | Real GeoGuessr socket flow test (skips without a Maps key) |
 | `node scripts/smokeWordChain.mjs` | Word Chain socket flow test (no keys needed) |
-| `node scripts/generateWordChains.mjs [n]` | Grow the Word Chain bank to n puzzles (default 500) |
+| `node scripts/generateWordChains.mjs [n]` | Grow the Word Chain bank to n puzzles **per length** (default 400) |
 | `npx tsx scripts/resolvePanos.ts` | Bake Street View panorama ids into the pool |
 | `npm run lint`     | ESLint (also the first CI gate)                |
 | `npx tsc --noEmit` | Typecheck, **including `server/`** — run after `npm run build` |
