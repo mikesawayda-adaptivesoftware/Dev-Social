@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, type CSSProperties } from "react";
 
 const COLORS = ["#f87171", "#facc15", "#4ade80", "#22d3ee", "#a78bfa", "#f472b6"];
 
@@ -31,13 +31,20 @@ export function Confetti({ count = 80 }: { count?: number }) {
         <span
           key={p.id}
           className="confetti-piece"
-          style={{
-            left: `${p.left}vw`,
-            backgroundColor: p.color,
-            animationDelay: `${p.delay}s`,
-            animationDuration: `${p.duration}s`,
-            transform: `rotate(${p.rotate}deg)`,
-          }}
+          style={
+            {
+              left: `${p.left}vw`,
+              backgroundColor: p.color,
+              animationDelay: `${p.delay}s`,
+              animationDuration: `${p.duration}s`,
+              // Handed to the keyframes rather than set as an inline
+              // `transform`: the animation drives transform, and an animated
+              // property outranks the inline style for as long as it runs — so
+              // an inline rotate here would only ever be visible on a piece
+              // that wasn't animating yet.
+              "--confetti-spin": `${p.rotate}deg`,
+            } as CSSProperties
+          }
         />
       ))}
     </div>
