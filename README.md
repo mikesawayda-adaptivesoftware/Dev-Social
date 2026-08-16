@@ -4,7 +4,7 @@ A live, Jackbox-style party-game platform for monthly team happy hours. The host
 opens a room on the big screen, everyone joins from their phone with a 4-letter
 code, and you play together in real time.
 
-Two games ship today:
+Three games ship today:
 
 - **Photo Guessr** — everyone submits a baby photo (or any guess-worthy pic),
   then the room competes to match each photo to the right teammate. Points for
@@ -13,6 +13,9 @@ Two games ship today:
   their phone, explores, and drops a pin on a world map. You score by how close
   your pin is to the true location. (Needs a Google Maps API key — see
   [Google Maps setup](#google-maps-setup-for-real-geoguessr).)
+- **Word Chain** — everyone races the same clock on one seeded chain of words,
+  where each neighbouring pair makes a compound word (SUN·FLOWER·BED·ROOM). Fill
+  the blanks between the two ends before the timer runs out. Plays fine solo.
 
 It's built as a **reusable platform first, game second** — so adding next
 month's game is mostly about writing a new state machine, not rebuilding rooms,
@@ -75,6 +78,34 @@ phones using your machine's network URL (printed by Next as `Network:`), e.g.
 > scoreboard entirely). Toggle **"I'm playing too"** in the lobby to have the
 > host guess from their device and appear in the standings. All players in a
 > game get the same 5 locations, drawn once when the game starts.
+
+## How to play (Word Chain)
+
+1. **Host** creates a room and, in the lobby, picks **Word Chain** and the time
+   limit (**1 / 2 / 5 minutes**). "I'm playing too" is on by default here.
+2. Everyone **joins** from their phone with the code + their name. One player is
+   fine — you're racing the clock either way.
+3. Host starts → everyone gets **the same chain** at the same time: two words
+   given, four blanks between them. Each neighbouring pair makes a compound word
+   or set phrase, so `KEY · ? · ? · ? · ? · PUNCH` resolves to
+   KEY**NOTE**, NOTE**BOOK**, BOOK**WORM**, WORM**HOLE**, HOLE PUNCH.
+4. Solve **top to bottom**. Each blank shows its length and its first letter;
+   **💡 Reveal a letter** buys one more for −100 points. Wrong answers cost
+   nothing but time.
+5. **500 points per link**, plus **1,000** for completing the chain and up to
+   **2,000** more for the time you had left — a clean sweep tops out at 5,000,
+   the same ceiling as a perfect GeoGuessr round.
+6. Finish early and you **wait on the others**, watching the live race board.
+   The round ends when everyone finishes or the clock runs out, then **Reveal**
+   shows the whole chain and everyone's times, and **Final** crowns a champion.
+
+> **No repeats, ever.** A game is a single puzzle, so a chain someone has
+> already played would hand them the whole game. The server picks from the
+> chains *nobody in the room* has played, and only falls back to least-seen once
+> that group has collectively played the entire bank. History lives in the
+> `player_word_chains_seen` table, so this needs Supabase configured — in local
+> mode the pick is simply random. Grow the bank by adding entries to
+> `server/wordChains.ts`.
 
 ## Google Maps setup (for Real GeoGuessr)
 
@@ -141,6 +172,8 @@ src/
                           #   Playing, Reveal, Final (+ shared widgets)
       geo/                # Real GeoGuessr: StreetViewPano, GuessMap,
                           #   GeoPlaying, GeoReveal
+      word/               # Word Chain: ChainBoard (tiles + race board),
+                          #   WordChainPlaying, WordChainReveal
     ui.tsx, Confetti.tsx
   lib/
     socket.ts             # Socket.IO client singleton + persisted identity
@@ -153,9 +186,11 @@ server/
   index.ts                # Socket.IO server: wires events -> RoomStore
   rooms.ts                # RoomStore: in-memory rooms + game state machines
   geoLocations.ts         # Curated GeoGuessr pool + panorama resolver
+  wordChains.ts           # Seeded Word Chain puzzle bank + answer normalizing
 scripts/
   smoke.mjs, smoke2.mjs   # End-to-end socket tests (node scripts/smoke.mjs)
   smokeGeo.mjs            # GeoGuessr socket flow test
+  smokeWordChain.mjs      # Word Chain socket flow test
   resolvePanos.ts         # Bake Street View panorama ids into the pool
 ```
 
@@ -230,17 +265,26 @@ What's wired up:
 The schema was created via migrations (`games`, `game_players`,
 `season_leaderboard`, and the `photos` Storage bucket).
 
-> **Applying new migrations.** The richer leaderboard views
-> (`supabase/migrations/0003_leaderboard_views.sql`), the name+PIN identity
-> table (`supabase/migrations/0004_players_identity.sql`), and the per-player
-> GeoGuessr location history (`supabase/migrations/0005_player_locations_seen.sql`)
-> have already been applied to the hosted project (via the Supabase MCP
-> `apply_migration`). To apply them to a fresh project, run `supabase db push`,
-> paste their contents into the Supabase Dashboard → **SQL editor**, or use the
-> Supabase MCP. Until `0003` is applied the `/leaderboard` page errors on the
-> missing `season_leaderboard_by_type` view; until `0004` is applied,
-> hosting/joining a Supabase-backed server fails on the missing `players` table;
-> `0005` is optional (location dedup silently no-ops without it).
+> **Applying new migrations.** A push to `main` that touches
+> `supabase/migrations/**` runs **Deploy database migrations**, which links the
+> project and runs `supabase db push --linked`. Adding a migration is committing
+> a file; nothing is applied by hand. The filenames are the versions the remote
+> `schema_migrations` table records, so a rename would make an applied migration
+> look pending — add new files, don't renumber old ones.
+>
+> That workflow and **Deploy** are independent and race, so a new image can be
+> live for a minute or two before its migration is. Write migrations that a
+> slightly older image tolerates, and features that tolerate a missing table:
+> the two history tables below already do.
+>
+> For a **fresh** project, `supabase db push` applies everything in order. Until
+> `..._leaderboard_views` is applied the `/leaderboard` page errors on the
+> missing `season_leaderboard_by_type` view; until `..._players_identity` is
+> applied, hosting/joining a Supabase-backed server fails on the missing
+> `players` table. The two history tables are optional —
+> `..._player_locations_seen` and `..._player_word_chains_seen` silently no-op
+> when absent, they just stop steering games away from content a player has
+> already had.
 
 ### Going fully Supabase-native (optional, later)
 
@@ -555,6 +599,7 @@ server {
 | `node scripts/smoke.mjs`  | End-to-end flow test against `:3001`    |
 | `node scripts/smoke2.mjs` | Deterministic scoring test              |
 | `node scripts/smokeGeo.mjs` | Real GeoGuessr socket flow test (skips without a Maps key) |
+| `node scripts/smokeWordChain.mjs` | Word Chain socket flow test (no keys needed) |
 | `npx tsx scripts/resolvePanos.ts` | Bake Street View panorama ids into the pool |
 | `npm run lint`     | ESLint (also the first CI gate)                |
 | `npx tsc --noEmit` | Typecheck, **including `server/`** — run after `npm run build` |

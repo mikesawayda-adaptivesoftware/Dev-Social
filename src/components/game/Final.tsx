@@ -71,9 +71,9 @@ export function Final() {
             disabled={busy}
             className="w-full max-w-sm"
           >
-            {state.gameType === "geo_guessr"
-              ? "Back to lobby ↻"
-              : "Play again (new photos) ↻"}
+            {state.gameType === "photo_guessr"
+              ? "Play again (new photos) ↻"
+              : "Back to lobby ↻"}
           </Button>
         </div>
       )}

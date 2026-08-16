@@ -8,7 +8,7 @@ export type GamePhase =
   | "reveal"
   | "final";
 
-export type GameType = "photo_guessr" | "geo_guessr";
+export type GameType = "photo_guessr" | "geo_guessr" | "word_chain";
 
 // Whether a room is discoverable in the public games browser. Private rooms are
 // reachable only by their code / join link, which is the historical behaviour.
@@ -19,17 +19,25 @@ export type RoomVisibility = "public" | "private";
 export const GAME_TYPE_LABELS: Record<GameType, string> = {
   photo_guessr: "Photo Guessr",
   geo_guessr: "Real GeoGuessr",
+  word_chain: "Word Chain",
 };
 
 export const GAME_TYPE_EMOJI: Record<GameType, string> = {
   photo_guessr: "📸",
   geo_guessr: "🗺️",
+  word_chain: "🔗",
 };
 
 export const GAME_TYPE_BLURB: Record<GameType, string> = {
   photo_guessr: "Match everyone's photos to the right teammate.",
   geo_guessr: "Explore Street View and pin the location on a map.",
+  word_chain: "Race to fill the missing links between two words.",
 };
+
+/** Whether a string is a game type we know about (enabled or not). */
+export function isKnownGameType(value: string): value is GameType {
+  return Object.hasOwn(GAME_TYPE_LABELS, value);
+}
 
 /**
  * Games that can currently be played. This is the single switch for taking a
@@ -42,7 +50,10 @@ export const GAME_TYPE_BLURB: Record<GameType, string> = {
  *
  * To re-enable Photo Guessr, put "photo_guessr" back in this list.
  */
-export const ENABLED_GAME_TYPES = ["geo_guessr"] as const satisfies readonly GameType[];
+export const ENABLED_GAME_TYPES = [
+  "geo_guessr",
+  "word_chain",
+] as const satisfies readonly GameType[];
 
 /** What a fresh lobby opens on. Must be an enabled game. */
 export const DEFAULT_GAME_TYPE: GameType = ENABLED_GAME_TYPES[0];
@@ -135,6 +146,84 @@ export interface GeoRevealView {
   results: GeoResult[];
 }
 
+// ---- Word Chain ----
+//
+// One seeded puzzle per game: a chain of words where each neighbouring pair
+// makes a compound word or a set phrase (SUN → FLOWER → BED → ROOM → …). The
+// two ends are given; everyone races to fill the blanks between them, top down.
+//
+// Answers never leave the server until the solver earns them: a blank exposes
+// only its length and the letters that particular viewer has unlocked, and the
+// whole chain appears only at the reveal.
+
+/** One blank in the chain, as a single viewer currently sees it. */
+export interface WordChainBlank {
+  /** Letters in the answer, so the client can draw the right number of slots. */
+  length: number;
+  /**
+   * The prefix this viewer can see: the free first letter, plus one more per
+   * hint they've spent. Personal — hints don't leak to the rest of the room.
+   */
+  revealed: string;
+  /** The answer. Present only on blanks this viewer has already solved. */
+  solvedWord?: string;
+}
+
+/**
+ * One player's position in the race. Deliberately tiny: it's broadcast to the
+ * whole room on every correct answer.
+ */
+export interface WordChainStanding {
+  playerId: string;
+  solved: number;
+  finished: boolean;
+}
+
+export interface WordChainRoundView {
+  puzzleId: string;
+  startWord: string;
+  endWord: string;
+  blanks: WordChainBlank[];
+  /** The blank this viewer answers next; equals `blanks.length` once done. */
+  activeIndex: number;
+  endsAt: number; // epoch ms when the puzzle auto-closes
+  /** This viewer finished the chain and is now waiting on everyone else. */
+  finished: boolean;
+  /** Points banked so far, bonuses included once finished. */
+  myPoints: number;
+  hintsUsed: number;
+  /** Everyone's progress, including this viewer's, for the live race board. */
+  standings: WordChainStanding[];
+  spectating: boolean; // true if this client watches instead of solving
+  isHost: boolean;
+}
+
+export interface WordChainResult {
+  playerId: string;
+  solved: number;
+  total: number;
+  finished: boolean;
+  /** ms from start to completing the chain; null if they never finished. */
+  timeMs: number | null;
+  hintsUsed: number;
+  points: number;
+}
+
+export interface WordChainRevealView {
+  puzzleId: string;
+  /** The full chain, answers included. Only ever sent once the round is over. */
+  words: string[];
+  results: WordChainResult[];
+}
+
+/** Ack payload for a submitted answer. `word` is set only on a correct guess. */
+export interface WordChainGuessResult {
+  correct: boolean;
+  solved: number;
+  finished: boolean;
+  word?: string;
+}
+
 /**
  * A room as it appears in the public games browser. Deliberately minimal — this
  * goes to anyone on the site, including people not in the room.
@@ -163,6 +252,8 @@ export interface RoomState {
   reveal?: RevealView;
   geoRound?: GeoRoundView;
   geoReveal?: GeoRevealView;
+  wordRound?: WordChainRoundView;
+  wordReveal?: WordChainRevealView;
   final?: { ranking: { playerId: string; score: number }[] };
 }
 
@@ -182,6 +273,10 @@ export const DEFAULT_SETTINGS: GameSettings = {
 // Per-round explore/guess timer for GeoGuessr the host may pick in the lobby.
 export const GEO_DURATION_OPTIONS_SEC = [60, 90, 120] as const;
 export const GEO_DEFAULT_DURATION_SEC = 90;
+
+// How long the whole Word Chain race runs — 1, 2 or 5 minutes, host's pick.
+export const WORD_CHAIN_DURATION_OPTIONS_SEC = [60, 120, 300] as const;
+export const WORD_CHAIN_DEFAULT_DURATION_SEC = 120;
 
 /**
  * Hard cap on players in one room. A real decision now — it used to be an
@@ -243,6 +338,21 @@ export interface ClientToServerEvents {
     payload: { lat: number; lng: number },
     ack?: (res: AckResult<{ ok: true }>) => void
   ) => void;
+  "host:startWordChain": (
+    payload: { durationSec: number; hostPlaying: boolean },
+    ack?: (res: AckResult<{ ok: true }>) => void
+  ) => void;
+  // Answer one blank in the chain. `index` guards against a stale client
+  // answering a blank it has already moved past.
+  "word:guess": (
+    payload: { index: number; guess: string },
+    ack?: (res: AckResult<WordChainGuessResult>) => void
+  ) => void;
+  // Buy one more letter of the current blank, for a points penalty. Private to
+  // the buyer — nobody else's view changes.
+  "word:hint": (
+    ack?: (res: AckResult<{ revealed: string; hintsUsed: number }>) => void
+  ) => void;
   "host:nextRound": (ack?: (res: AckResult<{ ok: true }>) => void) => void;
   "host:playAgain": (ack?: (res: AckResult<{ ok: true }>) => void) => void;
 }
@@ -275,6 +385,10 @@ export interface ServerToClientEvents {
   // Someone guessed. This is the entire news: a counter. Goes to everyone except
   // the guesser, who gets a snapshot instead.
   "round:progress": (payload: { answeredCount: number }) => void;
+  // Someone moved up the chain. Same bargain as `round:progress`: the whole
+  // room needs the race board, but only one player's position changed, so this
+  // is a single standing rather than a fresh snapshot each.
+  "chain:standing": (payload: WordChainStanding) => void;
   // Pushed to subscribers of the public games browser whenever the list changes.
   "rooms:list": (rooms: PublicRoomSummary[]) => void;
 }
