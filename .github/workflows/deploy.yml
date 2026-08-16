@@ -1,0 +1,104 @@
+name: Deploy
+
+# Push to main ships. There is no deploy script and no step that needs a machine
+# on the home LAN:
+#
+#   push -> CI gate -> build+push ghcr.io/<owner>/dev-social:latest
+#                   -> Watchtower on Unraid polls, pulls, restarts
+#
+# Delivery is pull-based on purpose. CI holds no SSH key, no VPN config and no
+# self-hosted runner, which is what makes a deploy something you can trigger
+# from a phone.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**.md'
+      - 'supabase/**'
+      - '.claude/**'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: true
+
+jobs:
+  # A failing lint, typecheck or build produces no image, so Watchtower has
+  # nothing new to pull. That is what makes pushing straight to main safe
+  # without branch protection.
+  verify:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Build and push to GHCR
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # The Actions token, not a PAT. The old deploy.sh required GITHUB_CR_PAT
+      # exported in the operator's shell, which meant only that shell could deploy.
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/dev-social
+          tags: |
+            type=raw,value=latest
+            type=sha,format=long
+
+      # NEXT_PUBLIC_* are inlined into the browser bundle at build time, so they
+      # have to be build args — they cannot be injected at run time. All of them
+      # are public by design (publishable anon key, public origin, referrer-locked
+      # browser Maps key), which is why they were previously hardcoded in
+      # deploy.sh. They live in repo Variables/Secrets now so changing the domain
+      # is a settings edit, not a code edit in two files.
+      #
+      # Build args are recoverable from image history. Nothing here is a secret;
+      # keep the browser Maps key HTTP-referrer-restricted in Google Cloud Console,
+      # because it ships in the JS bundle regardless of how it gets there.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NEXT_PUBLIC_GAME_SERVER_URL=${{ vars.PUBLIC_ORIGIN }}
+            NEXT_PUBLIC_SUPABASE_URL=${{ vars.SUPABASE_URL }}
+            NEXT_PUBLIC_SUPABASE_ANON_KEY=${{ secrets.SUPABASE_ANON_KEY }}
+            NEXT_PUBLIC_GOOGLE_MAPS_API_KEY=${{ secrets.GOOGLE_MAPS_BROWSER_KEY }}
+            NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID=${{ vars.GOOGLE_MAPS_MAP_ID }}
+            BUILD_SHA=${{ github.sha }}
+
+      # Watchtower is silent, so this line is how you know what to expect and
+      # what to check for from a phone.
+      - name: Summary
+        run: |
+          {
+            echo "### Pushed \`ghcr.io/${{ github.repository_owner }}/dev-social:latest\`"
+            echo
+            echo "Commit \`${{ github.sha }}\`"
+            echo
+            echo "Watchtower on Unraid pulls within its poll interval. Confirm with:"
+            echo
+            echo '```'
+            echo "curl -s ${{ vars.PUBLIC_ORIGIN }}/api/health"
+            echo '```'
+            echo
+            echo "The \`sha\` it returns should be \`${{ github.sha }}\`."
+          } >> "$GITHUB_STEP_SUMMARY"

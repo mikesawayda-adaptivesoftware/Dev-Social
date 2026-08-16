@@ -17,6 +17,10 @@ import type {
 
 const PORT = Number(process.env.GAME_SERVER_PORT ?? 3001);
 const CORS_ORIGIN = process.env.GAME_CLIENT_ORIGIN ?? "*";
+// Baked into the image by CI. Mirrors what /api/health reports on the Next side;
+// this one is only reachable on the LAN, which makes it the way to tell the two
+// processes apart if they ever disagree about which build they are.
+const BUILD_SHA = process.env.BUILD_SHA ?? "dev";
 
 interface SocketData {
   code?: string;
@@ -33,8 +37,11 @@ type GameSocket = Socket<
 const store = new RoomStore();
 const httpServer = createServer((req, res) => {
   if (req.url === "/health") {
-    res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ ok: true }));
+    res.writeHead(200, {
+      "content-type": "application/json",
+      "cache-control": "no-store",
+    });
+    res.end(JSON.stringify({ ok: true, sha: BUILD_SHA }));
     return;
   }
   res.writeHead(404);

@@ -256,113 +256,135 @@ app (`:3000`) and the Socket.IO game server (`:3001`) — with hosted Supabase a
 the system of record. No code changes are needed; it's the same `npm start` you
 run locally.
 
+### How a deploy happens
+
+```bash
+git push origin main
+```
+
+There is no deploy script and nothing to run on a workstation.
+
+```
+push to main
+  └─ CI: lint → next build → tsc --noEmit         .github/workflows/ci.yml
+      └─ build linux/amd64, push :latest + :sha-… .github/workflows/deploy.yml
+          └─ Watchtower on Unraid polls, pulls, restarts        (~5 min)
+```
+
+Two properties matter and are worth not breaking:
+
+- **The publish job `needs:` the CI job.** A failing lint, typecheck or build
+  produces no image, so a broken build never reaches Unraid. That is what makes
+  pushing straight to `main` safe without branch protection.
+- **Delivery is pull-based.** Watchtower reaches out to GHCR; CI never reaches
+  in. No SSH key, no VPN, no self-hosted runner, no inbound port — which is why
+  a deploy needs nothing but a `git push`, from anywhere.
+
+Migrations under `supabase/migrations/` apply themselves the same way, via
+`.github/workflows/deploy-migrations.yml`.
+
+Confirm what's live:
+
+```bash
+curl -s https://dev-social.adaptivesoftware.co/api/health
+```
+
+`sha` is the commit the running image was built from — `BUILD_SHA` is baked into
+the runner stage by CI. The game server reports the same value on its own
+`/health` (`http://192.168.0.248:3093/health`, LAN only), which is how you tell
+the two processes apart if they ever disagree.
+
+> ⚠️ **Room state is in memory** (`server/rooms.ts`, no Redis adapter). Every
+> Watchtower restart ends every game in progress. Don't merge during a happy
+> hour, or set `WATCHTOWER_SCHEDULE` on the Unraid box so updates land at a
+> known quiet time instead of within minutes.
+
+To roll back, pin `image:` in the Unraid compose file to a `:sha-<commit>` tag
+and `docker compose up -d`.
+
 ### Build-time vs. run-time config (read this first)
 
-Three values are **`NEXT_PUBLIC_*`**, which Next.js **inlines into the browser
-bundle at build time** — so they must be passed as Docker **build args**, not
-runtime `-e` vars. They're public/non-secret:
+Five values are **`NEXT_PUBLIC_*`**, which Next.js **inlines into the browser
+bundle at build time** — so they must be Docker **build args**, not runtime env
+vars. They're public/non-secret, and CI supplies them from repo Variables and
+Secrets:
 
-| Value                          | Set as       | Where                       |
-| ------------------------------ | ------------ | --------------------------- |
-| `NEXT_PUBLIC_GAME_SERVER_URL`  | build arg    | your public origin          |
-| `NEXT_PUBLIC_SUPABASE_URL`     | build arg    | Supabase project URL        |
-| `NEXT_PUBLIC_SUPABASE_ANON_KEY`| build arg    | Supabase publishable key    |
-| `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` | build arg | GeoGuessr Street View + map (optional) |
-| `GAME_CLIENT_ORIGIN`           | runtime `-e` | locks the socket server CORS|
-| `GOOGLE_MAPS_API_KEY`          | runtime `-e` | GeoGuessr pano resolution (optional, unrestricted) |
-| `SUPABASE_URL`                 | runtime `-e` | Supabase project URL        |
-| `SUPABASE_SERVICE_ROLE_KEY`    | runtime `-e` | **secret** (see below)      |
+| Value                             | Set as        | Comes from                              |
+| --------------------------------- | ------------- | --------------------------------------- |
+| `NEXT_PUBLIC_GAME_SERVER_URL`     | build arg     | Variable `PUBLIC_ORIGIN`                |
+| `NEXT_PUBLIC_SUPABASE_URL`        | build arg     | Variable `SUPABASE_URL`                 |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY`   | build arg     | Secret `SUPABASE_ANON_KEY`              |
+| `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` | build arg     | Secret `GOOGLE_MAPS_BROWSER_KEY`        |
+| `NEXT_PUBLIC_GOOGLE_MAPS_MAP_ID`  | build arg     | Variable `GOOGLE_MAPS_MAP_ID`           |
+| `BUILD_SHA`                       | build arg     | `github.sha` (reported by `/api/health`)|
+| `GAME_CLIENT_ORIGIN`              | runtime       | `infra/docker-compose.yml`              |
+| `SUPABASE_URL`                    | runtime       | `infra/docker-compose.yml`              |
+| `SUPABASE_SERVICE_ROLE_KEY`       | runtime       | Unraid `.env` — **secret** (see below)  |
+| `GOOGLE_MAPS_API_KEY`             | runtime       | Unraid `.env` (optional, unrestricted)  |
 
 If you build without `NEXT_PUBLIC_GAME_SERVER_URL` set to your real origin, the
 deployed site tries to open the socket against `localhost:3001` and fails for
-everyone. `docker-compose.yml` and `deploy.sh` already set these build args.
+everyone. Because these are baked, **changing any of them needs a new build** —
+edit the Variable/Secret, then re-run **Deploy** from the Actions tab.
 
 ### The `service_role` secret
 
 The server uses Supabase's `service_role` key for all writes + photo uploads. It
 **bypasses RLS**, so it must stay server-side — never in the browser, never
-committed.
+committed. It never passes through CI: the image contains no credentials, and
+the key exists only in a file on the Unraid host.
 
-- It already lives in `.env.local` (`SUPABASE_SERVICE_ROLE_KEY=...`).
+- Locally it lives in `.env.local` (`SUPABASE_SERVICE_ROLE_KEY=...`).
 - From the dashboard: **Project Settings → API Keys → `service_role`** (listed
   as `secret`; under "Legacy API keys" in the current UI). A newer `sb_secret_…`
   key works too.
-
-Put it in a `.env` file next to `docker-compose.yml` (gitignored) so compose and
-`deploy.sh` can read it:
-
-```bash
-cp .env.docker.example .env   # then paste the service_role key
-```
+- In production it lives in `/mnt/user/appdata/dev-social/.env` next to the
+  compose file — see `infra/.env.unraid.example`.
 
 > Without it, the app still runs — just fully in-memory (no persistence/storage).
 
-### Option A — run on this host (docker compose)
-
-Build the image locally and run both processes:
+### Running it locally
 
 ```bash
-docker compose up -d --build
+cp .env.docker.example .env   # then paste the service_role key
+npm run docker:local          # docker compose up --build
 ```
 
-### Option B — publish to ghcr.io, run on Unraid (`deploy.sh`)
+The root `docker-compose.yml` is a **local build** file. `infra/docker-compose.yml`
+is the pull-only production stack for Unraid; it has no `build:` key, because
+nothing is ever built on that box.
 
-For a build-on-your-Mac, run-on-Unraid flow, use the included `deploy.sh`. It
-builds a **`linux/amd64`** image (Unraid's arch — a plain `docker compose build`
-on Apple Silicon would produce an arm64 image that won't run there), pushes it to
-the **GitHub Container Registry** (`ghcr.io`), and prints the Unraid setup +
-`docker run` commands.
+### Unraid, one time
 
 ```bash
-# one-time setup
-export GITHUB_CR_PAT='ghp_...'   # GitHub PAT with write:packages + read:packages
-                                 #   https://github.com/settings/tokens
+mkdir -p /mnt/user/appdata/dev-social && cd /mnt/user/appdata/dev-social
 
-./deploy.sh                  # build (linux/amd64) + push to ghcr.io
-./deploy.sh "commit message" # git commit/push to GitHub first, then build + push
-./deploy.sh --local          # build & run locally via docker compose
-```
+# 1. Copy infra/docker-compose.yml from the repo to here. Needed again only when
+#    that file changes — image updates need nothing.
 
-The image is `ghcr.io/mikesawayda-adaptivesoftware/dev-social:latest`. Public
-config (origin, Supabase URL/anon key, optional Maps key) is set at the top of
-`deploy.sh` and baked in as build args; the `service_role` secret is read from
-`.env` and injected at run time only.
+# 2. Secrets beside it (see infra/.env.unraid.example).
+cat > .env <<'EOF'
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+GOOGLE_MAPS_API_KEY=your-unrestricted-server-key
+EOF
+chmod 600 .env
 
-> **Make the ghcr package public** (one-time) so Unraid can pull without a login,
-> or keep it private and `docker login ghcr.io` on Unraid first (step 2 below).
-> GitHub → your profile → Packages → `dev-social` → Package settings → Change
-> visibility.
-
-The printed first-time Unraid setup (also emitted by the script):
-
-```bash
-# 1. (private package only) login to ghcr.io
+# 3. The ghcr package is private, so the host needs a login (one time).
 echo 'YOUR_GITHUB_PAT' | docker login ghcr.io -u mikesawayda-adaptivesoftware --password-stdin
 
-# 2. save the Supabase service_role secret ONCE (reused on every update)
-mkdir -p /mnt/user/appdata/dev-social
-printf %s 'YOUR_SUPABASE_SERVICE_ROLE_KEY' > /mnt/user/appdata/dev-social/service_role
-chmod 600 /mnt/user/appdata/dev-social/service_role
-
-# 3. pull + run (host ports 3092 = app, 3093 = socket)
-docker pull ghcr.io/mikesawayda-adaptivesoftware/dev-social:latest
+# 4. Replace any old hand-run container with the compose stack.
 docker rm -f dev-social 2>/dev/null || true
-SERVICE_ROLE=$(cat /mnt/user/appdata/dev-social/service_role)
-docker run -d --name dev-social --restart unless-stopped \
-  -p 3092:3000 -p 3093:3001 \
-  -e NODE_ENV=production \
-  -e GAME_CLIENT_ORIGIN='https://dev-social.adaptivesoftware.co' \
-  -e SUPABASE_URL='https://dlfjcxnnmtkzupvhdivw.supabase.co' \
-  -e SUPABASE_SERVICE_ROLE_KEY="$SERVICE_ROLE" \
-  -e GOOGLE_MAPS_API_KEY='your-server-maps-key' \
-  ghcr.io/mikesawayda-adaptivesoftware/dev-social:latest
+docker compose pull && docker compose up -d
 ```
 
-(`deploy.sh` adds the `GOOGLE_MAPS_API_KEY` line automatically when it's set in
-`.env`; drop it if you're not using Real GeoGuessr.)
+Then make sure **Watchtower can pull a private GHCR image** — it needs either
+the host's `~/.docker/config.json` mounted into it, or `REPO_USER`/`REPO_PASS`
+set on the Watchtower container. Don't make the package public as a shortcut:
+this image ships the full `src/` and `server/` source tree.
 
-To update after a future `./deploy.sh`: re-run steps 3 (pull → rm → run); the
-saved `service_role` file is reused.
+> Keep the package private rather than public. The runtime image intentionally
+> retains `node_modules`, `src/` and `server/` so `tsx` can run the game server
+> straight from TypeScript.
 
 #### Real GeoGuessr needs **two** Maps keys
 
@@ -377,7 +399,9 @@ GeoGuessr is the only feature that needs Google Maps, and it uses two keys with
 > **Don't reuse one referrer-restricted key for both.** The server key must not be
 > referrer-restricted or every panorama lookup is rejected and you get *"Couldn't
 > load any Street View locations."* The browser key is baked at build time, so
-> changing it requires a rebuild (`./deploy.sh`); the server key is runtime-only.
+> changing it requires a rebuild (edit the `GOOGLE_MAPS_BROWSER_KEY` secret, then
+> re-run **Deploy**); the server key is runtime-only, so editing the Unraid `.env`
+> and restarting the container is enough.
 > You can pre-bake panorama IDs instead with `npx tsx scripts/resolvePanos.ts` to
 > avoid the server needing a key at all.
 
@@ -439,7 +463,7 @@ server's CORS to this origin.
 
 > **Hostname must match everywhere.** `NEXT_PUBLIC_GAME_SERVER_URL` is baked into
 > the browser bundle at build time, so the Cloudflare record, the NPM proxy host,
-> and `PUBLIC_ORIGIN` in `deploy.sh` must all use the exact same hostname
+> and the `PUBLIC_ORIGIN` repo Variable must all use the exact same hostname
 > (`dev-social.adaptivesoftware.co`). A mismatch loads the page but silently
 > fails the socket connection — rebuild after any change.
 
@@ -479,20 +503,31 @@ server {
 </details>
 
 > The schema for the hosted Supabase project lives in `supabase/migrations/`.
-> Apply it with the Supabase CLI (`supabase db push`) or the dashboard SQL editor
-> before first run.
+> Changes there apply themselves on push to `main`. Before the very first
+> automated run, trigger **Deploy database migrations** manually with `dry_run`
+> checked and read the `supabase migration list --linked` output: the 0001–0005
+> migrations were applied by hand, so production may have no migration history
+> rows, and a blind `db push` would try to replay them against objects that
+> already exist.
 
-### Deploy checklist
+### One-time setup checklist
 
-1. Cloudflare: proxied CNAME `dev-social` → `adaptivesoftware.co`.
-2. NPM: proxy host `dev-social.adaptivesoftware.co` → `:3092` (websockets on) +
-   `/socket.io/` location → `:3093`, Let's Encrypt SSL.
-3. `.env` has `SUPABASE_SERVICE_ROLE_KEY` (and optionally
-   `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` to ship GeoGuessr enabled).
-4. Start Docker Desktop, `export GITHUB_CR_PAT=…`, run `./deploy.sh "message"`.
-5. On Unraid: run the printed setup (saves `service_role`, then pull → run).
-6. Open `https://dev-social.adaptivesoftware.co` and start a game to confirm the
-   socket connects (check the browser console for a `/socket.io/` connection).
+1. **GitHub → Settings → Secrets and variables → Actions.** Variables
+   `PUBLIC_ORIGIN`, `SUPABASE_URL`, `GOOGLE_MAPS_MAP_ID`; secrets
+   `SUPABASE_ANON_KEY`, `GOOGLE_MAPS_BROWSER_KEY`, and — for schema deploys —
+   `SUPABASE_ACCESS_TOKEN` and `SUPABASE_DB_PASSWORD`. The migrations workflow
+   skips with a warning until those last two exist, so the pipeline stays green
+   in the meantime.
+2. **Cloudflare**: proxied CNAME `dev-social` → `adaptivesoftware.co`, SSL/TLS
+   mode Full.
+3. **NPM**: proxy host `dev-social.adaptivesoftware.co` → `:3092` (websockets
+   on) + `/socket.io/` location → `:3093`, Let's Encrypt SSL.
+4. **Unraid**: `infra/docker-compose.yml` and a `.env` in
+   `/mnt/user/appdata/dev-social/`, then `docker compose up -d`.
+5. **Watchtower**: confirm it can pull the private GHCR package.
+6. Push to `main`, then check `curl -s https://dev-social.adaptivesoftware.co/api/health`
+   and start a game to confirm the socket connects (look for a `/socket.io/`
+   connection in the browser console).
 
 ### Updating vs. troubleshooting
 
@@ -500,10 +535,13 @@ server {
 | ------- | ------------ |
 | Page loads, but "connecting…" never resolves / games don't start | Socket blocked — check the NPM `/socket.io/` location points at `:3093` with the upgrade headers, and the baked origin matches the domain |
 | Redirect loop / `ERR_TOO_MANY_REDIRECTS` | Cloudflare SSL/TLS mode is *Flexible* — set it to *Full* |
-| `docker pull` denied on Unraid | Package is private — `docker login ghcr.io` (step 1) or make the ghcr package public |
+| `docker pull` denied on Unraid | Package is private — `docker login ghcr.io` on the host, and give Watchtower the same credentials |
+| CI green but no new image | The push only touched `paths-ignore` paths (`**.md`, `supabase/**`, `.claude/**`) — run **Deploy** manually from the Actions tab |
+| `/api/health` still reports the old sha | Watchtower hasn't polled yet — check `docker logs watchtower`, then that it can pull the private package |
+| Games all died mid-session | Expected: a Watchtower restart clears in-memory room state. Merge outside game time, or set `WATCHTOWER_SCHEDULE` |
 | NPM save → *Internal Error*; `nginx -t` shows `"proxy_http_version" directive is duplicate` | Remove `proxy_http_version` from the `/socket.io/` advanced box — the Websockets Support toggle already adds it |
 | Cloudflare **525** (SSL handshake failed) | Origin TLS not active — NPM proxy host has no cert, or its config failed to reload (see the duplicate-directive row above) |
-| GeoGuessr shows a setup hint | No `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` was set at **build** time — add it to `.env` and re-run `./deploy.sh` (it's baked, not runtime) |
+| GeoGuessr shows a setup hint | No `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` was set at **build** time — set the `GOOGLE_MAPS_BROWSER_KEY` secret and re-run **Deploy** (it's baked, not runtime) |
 | GeoGuessr: *Couldn't load any Street View locations… configured for the server* | Server `GOOGLE_MAPS_API_KEY` missing, referrer-restricted, or lacking the Street View Static API — set an **unrestricted** server key and redeploy |
 | Leaderboard errors / no persistence | `SUPABASE_SERVICE_ROLE_KEY` missing on the container, or migrations not applied to the project |
 
@@ -518,8 +556,9 @@ server {
 | `node scripts/smoke2.mjs` | Deterministic scoring test              |
 | `node scripts/smokeGeo.mjs` | Real GeoGuessr socket flow test (skips without a Maps key) |
 | `npx tsx scripts/resolvePanos.ts` | Bake Street View panorama ids into the pool |
-| `./deploy.sh`      | Build `linux/amd64` image + push to ghcr.io    |
-| `./deploy.sh --local` | Build & run locally via docker compose      |
+| `npm run lint`     | ESLint (also the first CI gate)                |
+| `npx tsc --noEmit` | Typecheck, **including `server/`** — run after `npm run build` |
+| `npm run docker:local` | Build & run the container locally via docker compose |
 
 ## Tech
 

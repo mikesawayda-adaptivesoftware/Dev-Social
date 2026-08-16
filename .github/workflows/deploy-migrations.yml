@@ -1,0 +1,110 @@
+name: Deploy database migrations
+
+# The app image deploys itself on push; the database did not, so a schema change
+# still had to be applied by hand from a workstation with the Supabase CLI logged
+# in. That is the one remaining step that cannot happen from a phone.
+#
+# Requires two repository secrets beyond the ones deploy.yml uses:
+#   SUPABASE_ACCESS_TOKEN  — Supabase dashboard, Account → Access Tokens
+#   SUPABASE_DB_PASSWORD   — the project's Postgres password
+# The project ref is derived from the existing SUPABASE_URL rather than stored
+# as a third secret that could drift out of sync with it.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'supabase/migrations/**'
+      - '.github/workflows/deploy-migrations.yml'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'List pending migrations without applying them'
+        type: boolean
+        default: true
+
+concurrency:
+  group: deploy-migrations
+  # Never cancel a migration that is mid-flight. A half-applied schema is worse
+  # than a queued one.
+  cancel-in-progress: false
+
+jobs:
+  push:
+    name: Apply migrations
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      # Skips rather than fails when the secrets are not set yet, so the rest of
+      # the pipeline stays green until they are added. A workflow that is
+      # permanently red teaches you to ignore red.
+      - name: Resolve project ref
+        id: project
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: |
+          if [ -z "$SUPABASE_ACCESS_TOKEN" ] || [ -z "$SUPABASE_DB_PASSWORD" ]; then
+            echo "::warning::SUPABASE_ACCESS_TOKEN or SUPABASE_DB_PASSWORD is not set — skipping."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # https://<ref>.supabase.co  ->  <ref>
+          #
+          # Matched strictly. A dashboard link
+          # (https://supabase.com/dashboard/project/<ref>) would otherwise
+          # reduce to the ref "supabase" and this job would cheerfully link to
+          # whatever project that is, then run migrations against it.
+          if ! printf '%s' "$SUPABASE_URL" | grep -Eq '^https://[a-z0-9]+\.supabase\.co/?$'; then
+            echo "::error::SUPABASE_URL must be the project API origin (https://<ref>.supabase.co), got: $SUPABASE_URL"
+            exit 1
+          fi
+
+          ref="${SUPABASE_URL#https://}"
+          ref="${ref%%.*}"
+
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Link project
+        if: steps.project.outputs.ready == 'true'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: supabase link --project-ref "${{ steps.project.outputs.ref }}"
+
+      # Printed before anything is applied, so the run log says what changed
+      # rather than only that something did.
+      - name: Pending migrations
+        if: steps.project.outputs.ready == 'true'
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: supabase migration list --linked
+
+      # `dry_run` defaults to true so the first manual run is read-only. The
+      # 0001..0005 migrations were applied by hand, so production may have no
+      # migration history rows at all; a blind first push would try to replay
+      # them against objects that already exist. The list above says whether
+      # that is the case before anything is applied.
+      #
+      # On a `push` event `inputs` is empty, so dry_run is neither true nor
+      # false — commit-triggered runs apply, manual runs default to read-only.
+      # One condition, two behaviours, no duplicated job.
+      - name: Apply
+        if: steps.project.outputs.ready == 'true' && inputs.dry_run != true
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+        run: supabase db push --linked
+
+      - name: Dry run notice
+        if: steps.project.outputs.ready == 'true' && inputs.dry_run == true
+        run: echo "::notice::Dry run — nothing was applied. Re-run with dry_run unchecked to push."
