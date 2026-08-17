@@ -9,12 +9,16 @@ import {
   supabaseEnabled,
   uploadPhoto,
 } from "./supabase";
-import { WORD_CHAIN_LENGTH_OPTIONS } from "../src/shared/types";
+import {
+  MAX_SEATS_CHECKED,
+  WORD_CHAIN_LENGTH_OPTIONS,
+} from "../src/shared/types";
 import { WORD_CHAINS } from "./wordChains";
 import type {
   ClientToServerEvents,
   ServerToClientEvents,
   AckResult,
+  SeatStatus,
 } from "../src/shared/types";
 
 const PORT = Number(process.env.GAME_SERVER_PORT ?? 3001);
@@ -133,6 +137,24 @@ function broadcastRoom(code: string) {
 
 store.onRoomChanged = broadcastRoom;
 
+/**
+ * A newer connection claimed a seat, so retire the socket that held it.
+ *
+ * Order matters: clearing `socket.data` first means anything already in flight
+ * from that socket falls through the "You are not in a room" guard instead of
+ * driving a seat it no longer owns.
+ */
+store.onSocketEvicted = (socketId, reason) => {
+  const stale = io.sockets.sockets.get(socketId);
+  if (!stale) {
+    return;
+  }
+  stale.data.code = undefined;
+  stale.data.playerId = undefined;
+  stale.emit("room:closed", reason);
+  stale.disconnect(true);
+};
+
 // Persist completed games to Supabase (no-op when Supabase isn't configured).
 store.onGameFinished = (code) => {
   const finished = store.takeFinishedGame(code);
@@ -157,7 +179,33 @@ function fail(error: unknown): AckResult<never> {
 }
 
 io.on("connection", (socket) => {
+  /**
+   * Hand back the seat this socket held before it took a new one.
+   *
+   * Without this, one socket stays a member of two rooms and both keep counting
+   * it connected — which is how the same person ended up with two of their own
+   * games advertised in the browser at once.
+   *
+   * Always called *after* the new seat is granted, never before: creating and
+   * joining can both fail (bad PIN, full room, game already started), and
+   * releasing first would cost someone their existing seat for a typo.
+   */
+  const releasePreviousSeat = (previous: SocketData) => {
+    const { code, playerId } = previous;
+    if (!code || !playerId) {
+      return;
+    }
+    const { roomClosed } = store.leaveRoom(code, playerId);
+    socket.leave(code);
+    if (roomClosed) {
+      broadcastPublicRooms();
+    } else {
+      broadcastRoom(code);
+    }
+  };
+
   socket.on("room:create", async ({ name, pin, visibility }, ack) => {
+    const previous = { ...socket.data };
     try {
       const { code, playerId } = await store.createRoom(name, pin, visibility);
       socket.data.code = code;
@@ -165,6 +213,7 @@ io.on("connection", (socket) => {
       store.attachSocket(code, playerId, socket.id);
       socket.join(code);
       ack(ok({ code, playerId }));
+      releasePreviousSeat(previous);
       broadcastRoom(code);
     } catch (err) {
       ack(fail(err) as never);
@@ -172,6 +221,7 @@ io.on("connection", (socket) => {
   });
 
   socket.on("room:join", async ({ code, name, pin }, ack) => {
+    const previous = { ...socket.data };
     try {
       const res = await store.joinRoom(code, name, pin);
       socket.data.code = res.code;
@@ -179,6 +229,7 @@ io.on("connection", (socket) => {
       store.attachSocket(res.code, res.playerId, socket.id);
       socket.join(res.code);
       ack(ok(res));
+      releasePreviousSeat(previous);
 
       // The joiner needs everything; everyone else needs one new roster entry.
       // Snapshotting all of them here is what made filling a 100-player lobby
@@ -205,6 +256,19 @@ io.on("connection", (socket) => {
     socket.leave(BROWSE_ROOM);
   });
 
+  // Which of the seats a browser remembers are still live? Dead ones are simply
+  // omitted, so the client prunes by absence. The cap is there because the
+  // payload is client-supplied and this walks it.
+  socket.on("seats:check", ({ seats }, ack) => {
+    const alive = (Array.isArray(seats) ? seats : [])
+      .slice(0, MAX_SEATS_CHECKED)
+      .map(({ code, playerId }) =>
+        code && playerId ? store.describeSeat(code, playerId) : null
+      )
+      .filter((s): s is SeatStatus => s !== null);
+    ack(ok({ seats: alive }));
+  });
+
   socket.on("name:check", async ({ name }, ack) => {
     try {
       const claimed = await isNameClaimed(name);
@@ -215,20 +279,49 @@ io.on("connection", (socket) => {
   });
 
   socket.on("room:rejoin", ({ code, playerId }, ack) => {
+    const previous = { ...socket.data };
     try {
       store.rejoin(code, playerId, socket.id);
       socket.data.code = code;
       socket.data.playerId = playerId;
       socket.join(code);
       ack(ok({ ok: true as const }));
+      // Rejoining a different room than this socket last held is still a seat
+      // swap, so the old one has to go back.
+      if (previous.code !== code || previous.playerId !== playerId) {
+        releasePreviousSeat(previous);
+      }
 
       // A full snapshot here is what makes the delta scheme safe: any client
       // that dropped — and so may have missed deltas — resyncs on the way back.
       sendSnapshot(code, playerId, socket.id);
-      socket.to(code).emit("room:playerConnection", { playerId, connected: true });
-      broadcastPublicRooms();
+      // Rejoining can un-leave a seat and can move the crown back, neither of
+      // which a connection delta describes — so the room gets a real refresh.
+      broadcastRoom(code);
     } catch (err) {
       ack(fail(err) as never);
+    }
+  });
+
+  socket.on("room:leave", (ack) => {
+    const { code, playerId } = socket.data;
+    if (!code || !playerId) {
+      ack?.(ok({ ok: true as const }));
+      return;
+    }
+    try {
+      const { roomClosed } = store.leaveRoom(code, playerId);
+      socket.leave(code);
+      socket.data.code = undefined;
+      socket.data.playerId = undefined;
+      ack?.(ok({ ok: true as const }));
+      if (roomClosed) {
+        broadcastPublicRooms();
+      } else {
+        broadcastRoom(code);
+      }
+    } catch (err) {
+      ack?.(fail(err) as never);
     }
   });
 
@@ -509,23 +602,18 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => {
     const changed = store.markDisconnected(socket.id);
     for (const { code, playerId } of changed) {
-      const phaseBefore = store.getRoom(code)?.phase;
-      // A dropout may let the current round close early, or (if the host left)
-      // arm the reveal auto-advance, before we push the updated state.
-      store.handleDisconnect(code);
-      const room = store.getRoom(code);
-      if (!room) {
+      // The roster dims immediately — everyone should see that someone dropped.
+      // What waits is the *consequences*: closing a round, forcing a word pick,
+      // moving the crown. `handleDisconnect` schedules those behind a grace so a
+      // refresh, which looks identical to leaving from here, doesn't end anyone's
+      // round. It broadcasts itself if the grace expires.
+      store.handleDisconnect(code, playerId);
+      if (!store.getRoom(code)) {
         continue;
       }
-      if (room.phase !== phaseBefore) {
-        // The dropout closed the round — that's a phase change, everyone needs
-        // the new state.
-        broadcastRoom(code);
-      } else {
-        // This socket has already left its rooms, so io.to reaches the rest.
-        io.to(code).emit("room:playerConnection", { playerId, connected: false });
-        broadcastPublicRooms();
-      }
+      // This socket has already left its rooms, so io.to reaches the rest.
+      io.to(code).emit("room:playerConnection", { playerId, connected: false });
+      broadcastPublicRooms();
     }
   });
 });

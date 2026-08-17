@@ -82,6 +82,14 @@ export interface PublicPlayer {
   score: number;
   isHost: boolean;
   connected: boolean;
+  /**
+   * They tapped Leave, rather than dropping out.
+   *
+   * Still in the roster because reveal screens name whoever played each round,
+   * and a leaver may have played several. Hidden from the lobby list and the
+   * scoreboards — see the filters at those call sites.
+   */
+  left: boolean;
   photoCount: number;
   // A spectator is in the room but not competing (e.g. a host who chose not to
   // play). They're hidden from scoreboards, rankings, and persistence.
@@ -403,6 +411,26 @@ export interface DrawGuessResult {
 }
 
 /**
+ * A seat the browser remembers, confirmed by the server to still exist.
+ *
+ * Answers the only question the landing page needs: "is the game I was in still
+ * running, and what is it doing?" The playerId isn't echoed back — the client
+ * already has it, and it's the credential.
+ */
+export interface SeatStatus {
+  code: string;
+  name: string; // the seat's own name, so "Rejoin as Ada" is exact
+  hostName: string;
+  gameType: GameType;
+  phase: GamePhase;
+  playerCount: number;
+  isHost: boolean;
+}
+
+/** How many seats one client may ask about at a time. */
+export const MAX_SEATS_CHECKED = 10;
+
+/**
  * A room as it appears in the public games browser. Deliberately minimal — this
  * goes to anyone on the site, including people not in the room.
  */
@@ -501,6 +529,14 @@ export interface ClientToServerEvents {
     ack: (res: AckResult<{ rooms: PublicRoomSummary[] }>) => void
   ) => void;
   "rooms:unsubscribe": () => void;
+  // "Which of the seats I remember are still alive?" Answers with the live
+  // subset only — a seat the server has never heard of is simply absent, so the
+  // client can forget it. No new auth surface: playerId is already the rejoin
+  // credential, and nothing here is returned that a rejoin wouldn't give you.
+  "seats:check": (
+    payload: { seats: { code: string; playerId: string }[] },
+    ack: (res: AckResult<{ seats: SeatStatus[] }>) => void
+  ) => void;
   "room:join": (
     payload: { code: string; name: string; pin: string },
     ack: (res: AckResult<{ code: string; playerId: string }>) => void
@@ -513,6 +549,14 @@ export interface ClientToServerEvents {
     payload: { code: string; playerId: string },
     ack: (res: AckResult<{ ok: true }>) => void
   ) => void;
+  /**
+   * Give up the seat, so the room stops counting you.
+   *
+   * Recoverable on purpose: the seat is marked left rather than erased, and
+   * `room:rejoin` un-marks it. Leave is one tap next to the room code on a
+   * phone, and losing a game to a mis-tap is worse than a stale roster entry.
+   */
+  "room:leave": (ack?: (res: AckResult<{ ok: true }>) => void) => void;
   // Host-only, lobby-only. The host's game choice is server state, not local UI
   // state, so the lobby and the public games list both reflect it live.
   "host:setGameType": (

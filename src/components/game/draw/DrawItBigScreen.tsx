@@ -97,7 +97,7 @@ export function DrawItBigScreen() {
         {/* Who's in, at a glance — the drawer is marked rather than ranked. */}
         <ul className="flex flex-wrap gap-2">
           {state.players
-            .filter((p) => !p.spectator)
+            .filter((p) => !p.spectator && !p.left)
             .map((p) => {
               const isDrawer = p.id === draw.drawerId;
               const got = solvers.has(p.id);

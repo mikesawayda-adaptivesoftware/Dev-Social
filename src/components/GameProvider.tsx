@@ -20,6 +20,7 @@ import {
 } from "@/lib/socket";
 import type {
   AckResult,
+  ClientToServerEvents,
   DrawChatLine,
   DrawDifficultyChoice,
   DrawGuessResult,
@@ -40,8 +41,35 @@ type NoArgEvent =
   | "host:nextRound"
   | "host:playAgain";
 
+/** How long an action waits for the server before giving up. */
+const REQUEST_TIMEOUT_MS = 8000;
+
+/**
+ * The server never answered.
+ *
+ * Worth its own type for one reason: silence is not a refusal. A refused rejoin
+ * means the seat is gone and the recovery record should go with it; a timeout
+ * means we don't know, and throwing the record away would strand someone whose
+ * game is still running.
+ */
+class RequestTimeout extends Error {
+  constructor() {
+    super("The game server didn't answer. Try again.");
+    this.name = "RequestTimeout";
+  }
+}
+
 interface GameContextValue {
   connected: boolean;
+  /**
+   * Connected *and* holding a seat the server knows about.
+   *
+   * `connected` alone isn't enough for anything inside a room. Socket.IO buffers
+   * emits made while offline and flushes them the instant the socket is back —
+   * ahead of our `room:rejoin` — so they arrive before the server has any idea
+   * who we are and come back "You are not in a room."
+   */
+  ready: boolean;
   state: RoomState | null;
   identity: Identity | null;
   me: RoomState["players"][number] | null;
@@ -59,6 +87,8 @@ interface GameContextValue {
   // game ended or the server restarted). The room page turns this into a clear
   // "this game is no longer available" state instead of an endless spinner.
   seatLost: boolean;
+  /** Why, if the server said so. Null means we're guessing. */
+  lostReason: string | null;
   leave: () => void;
   setGameType: (gameType: GameType) => Promise<void>;
   startSubmission: () => Promise<void>;
@@ -233,7 +263,19 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
   const [state, setState] = useState<RoomState | null>(null);
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [seatLost, setSeatLost] = useState(false);
+  // Why the seat went, when the server bothered to say. Otherwise the screen
+  // guesses at "it may have ended, or the server restarted".
+  const [lostReason, setLostReason] = useState<string | null>(null);
   const identityRef = useRef<Identity | null>(null);
+  // Does the server currently have us in a room on *this* socket? Mirrored into
+  // a ref because `request` is called from callbacks that shouldn't re-create
+  // themselves every time it flips.
+  const [seatReady, setSeatReady] = useState(false);
+  const seatReadyRef = useRef(false);
+  const setSeat = useCallback((value: boolean) => {
+    seatReadyRef.current = value;
+    setSeatReady(value);
+  }, []);
 
   useEffect(() => {
     // Seed identity from sessionStorage on mount. This must run in an effect
@@ -259,21 +301,54 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
           "room:rejoin",
           { code: id.code, playerId: id.playerId },
           (res: AckResult<{ ok: true }>) => {
-            if (!res.ok) {
+            if (res.ok) {
+              // Only now is it safe to act: anything sent before this point
+              // reaches a server that doesn't know who we are.
+              setSeat(true);
+            } else {
               // The server no longer has our seat (game ended, or the server
               // restarted and lost in-memory state). Drop the dead active seat
               // and surface a clear state rather than a frozen spinner.
               identityRef.current = null;
               setIdentity(null);
               clearIdentity();
+              // …and the recovery record with it, or the room page keeps
+              // offering to rejoin a seat that has already been refused.
+              clearRecentSeat(id.code);
               setState(null);
               setSeatLost(true);
+              setLostReason(res.error);
             }
           }
         );
       }
     };
-    const onDisconnect = () => setConnected(false);
+    const onDisconnect = () => {
+      setConnected(false);
+      setSeat(false);
+    };
+    /**
+     * The server retired this connection — the seat is being played somewhere
+     * else now.
+     *
+     * Dropping the identity is what stops a ping-pong: the socket auto-
+     * reconnects, and `onConnect` would otherwise re-`room:rejoin` from the
+     * stored identity and yank the seat back off the tab that legitimately
+     * holds it.
+     */
+    const onRoomClosed = (reason: string) => {
+      const current = identityRef.current;
+      if (current) {
+        clearRecentSeat(current.code);
+      }
+      identityRef.current = null;
+      setIdentity(null);
+      clearIdentity();
+      setSeat(false);
+      setState(null);
+      setSeatLost(true);
+      setLostReason(reason);
+    };
     const onState = (next: RoomState) => setState(next);
     const onPlayerJoined = ({ player }: { player: PublicPlayer }) =>
       setState((s) => applyPlayerJoined(s, player));
@@ -302,6 +377,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
 
     socket.on("connect", onConnect);
     socket.on("disconnect", onDisconnect);
+    socket.on("room:closed", onRoomClosed);
     socket.on("room:state", onState);
     socket.on("room:playerJoined", onPlayerJoined);
     socket.on("room:playerConnection", onPlayerConnection);
@@ -317,6 +393,7 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
     return () => {
       socket.off("connect", onConnect);
       socket.off("disconnect", onDisconnect);
+      socket.off("room:closed", onRoomClosed);
       socket.off("room:state", onState);
       socket.off("room:playerJoined", onPlayerJoined);
       socket.off("room:playerConnection", onPlayerConnection);
@@ -326,251 +403,236 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       socket.off("draw:canvas", onDrawCanvas);
       socket.off("draw:chat", onDrawChat);
     };
-  }, []);
+  }, [setSeat]);
 
-  const persist = useCallback((id: Identity | null) => {
-    identityRef.current = id;
-    setIdentity(id);
-    if (id) {
-      setSeatLost(false);
-      saveIdentity(id);
-    } else {
-      clearIdentity();
-    }
-  }, []);
-
-  const createRoom = useCallback(
-    (name: string, pin: string, visibility: RoomVisibility) =>
-      new Promise<string>((resolve, reject) => {
-        getSocket().emit(
-          "room:create",
-          { name, pin, visibility },
-          (res: AckResult<{ code: string; playerId: string }>) => {
-            if (res.ok) {
-              persist({ code: res.code, playerId: res.playerId, isHost: true, name });
-              resolve(res.code);
-            } else {
-              reject(new Error(res.error));
-            }
-          }
-        );
-      }),
-    [persist]
+  const persist = useCallback(
+    (id: Identity | null) => {
+      identityRef.current = id;
+      setIdentity(id);
+      setSeat(Boolean(id));
+      if (id) {
+        setSeatLost(false);
+        saveIdentity(id);
+      } else {
+        clearIdentity();
+      }
+    },
+    [setSeat]
   );
 
-  const joinRoom = useCallback(
-    (code: string, name: string, pin: string) =>
-      new Promise<string>((resolve, reject) => {
-        getSocket().emit(
-          "room:join",
-          { code: code.toUpperCase(), name, pin },
-          (res: AckResult<{ code: string; playerId: string }>) => {
-            if (res.ok) {
-              persist({ code: res.code, playerId: res.playerId, isHost: false, name });
-              resolve(res.code);
-            } else {
-              reject(new Error(res.error));
-            }
-          }
-        );
-      }),
-    [persist]
-  );
-
-  const checkName = useCallback(
-    (name: string) =>
-      new Promise<boolean>((resolve) => {
-        if (!name.trim()) {
-          resolve(false);
+  /**
+   * Every request to the server, in one place.
+   *
+   * Two things this fixes over the fifteen hand-rolled promises it replaces.
+   * An ack that never comes used to leave the promise pending forever, and
+   * since every caller re-enables its button in `.finally()`, a single dropped
+   * ack disabled that button for the rest of the game. And an action fired
+   * while the socket is down is rejected here rather than buffered — Socket.IO
+   * would otherwise flush it on reconnect, ahead of our `room:rejoin`, where it
+   * bounces off "You are not in a room". Rejecting is deliberate: queuing would
+   * replay a round's actions into whatever round happens to be running by then.
+   */
+  const request = useCallback(
+    <T,>(
+      event: keyof ClientToServerEvents,
+      payload: unknown,
+      fallbackError: string,
+      needsSeat = true
+    ): Promise<T> =>
+      new Promise<T>((resolve, reject) => {
+        if (needsSeat && !seatReadyRef.current) {
+          reject(new Error("You're not connected to the game right now."));
           return;
         }
-        getSocket().emit(
-          "name:check",
-          { name: name.trim() },
-          (res: AckResult<{ claimed: boolean }>) => {
-            resolve(res.ok ? res.claimed : false);
+        // Socket.IO's generated overloads can't describe a generic event name,
+        // and the no-payload events collapse their ack argument to `never`. The
+        // narrow view here is the one escape hatch, instead of one per caller.
+        const sock = getSocket().timeout(REQUEST_TIMEOUT_MS) as unknown as {
+          emit: (event: string, ...args: unknown[]) => void;
+        };
+        const done = (err: Error | null, res?: AckResult<T>) => {
+          if (err) {
+            reject(new RequestTimeout());
+          } else if (res?.ok) {
+            resolve(res as unknown as T);
+          } else {
+            reject(new Error(res?.error ?? fallbackError));
           }
-        );
+        };
+        if (payload === undefined) {
+          sock.emit(event, done);
+        } else {
+          sock.emit(event, payload, done);
+        }
       }),
     []
   );
 
+  // Create, join, rejoin and name checks all run without a seat — they're how
+  // you get one.
+  const createRoom = useCallback(
+    async (name: string, pin: string, visibility: RoomVisibility) => {
+      const res = await request<{ code: string; playerId: string }>(
+        "room:create",
+        { name, pin, visibility },
+        "Couldn't create the room.",
+        false
+      );
+      persist({ code: res.code, playerId: res.playerId, isHost: true, name });
+      return res.code;
+    },
+    [persist, request]
+  );
+
+  const joinRoom = useCallback(
+    async (code: string, name: string, pin: string) => {
+      const res = await request<{ code: string; playerId: string }>(
+        "room:join",
+        { code: code.toUpperCase(), name, pin },
+        "Couldn't join the room.",
+        false
+      );
+      persist({ code: res.code, playerId: res.playerId, isHost: false, name });
+      return res.code;
+    },
+    [persist, request]
+  );
+
+  const checkName = useCallback(
+    async (name: string) => {
+      if (!name.trim()) {
+        return false;
+      }
+      try {
+        const res = await request<{ claimed: boolean }>(
+          "name:check",
+          { name: name.trim() },
+          "",
+          false
+        );
+        return res.claimed;
+      } catch {
+        // A name check that can't reach the server shouldn't block typing.
+        return false;
+      }
+    },
+    [request]
+  );
+
   const rejoin = useCallback(
-    (code: string) =>
-      new Promise<void>((resolve, reject) => {
-        const id = identityRef.current;
-        if (!id || id.code.toUpperCase() !== code.toUpperCase()) {
-          reject(new Error("No saved seat in this room."));
-          return;
-        }
-        getSocket().emit(
+    async (code: string) => {
+      const id = identityRef.current;
+      if (!id || id.code.toUpperCase() !== code.toUpperCase()) {
+        throw new Error("No saved seat in this room.");
+      }
+      try {
+        await request(
           "room:rejoin",
           { code: id.code, playerId: id.playerId },
-          (res: AckResult<{ ok: true }>) => {
-            if (res.ok) {
-              resolve();
-            } else {
-              persist(null);
-              reject(new Error(res.error));
-            }
-          }
+          "Couldn't rejoin that game.",
+          false
         );
-      }),
-    [persist]
+        setSeat(true);
+      } catch (e) {
+        // Only a refusal proves the seat is gone. Silence proves nothing, and
+        // throwing the record away on a timeout would strand someone whose game
+        // is still running.
+        if (!(e instanceof RequestTimeout)) {
+          persist(null);
+          clearRecentSeat(id.code);
+        }
+        throw e;
+      }
+    },
+    [persist, request, setSeat]
   );
 
   const rejoinRecent = useCallback(
-    (code: string) =>
-      new Promise<void>((resolve, reject) => {
-        const seat = loadRecentSeat(code);
-        if (!seat) {
-          reject(new Error("No saved seat in this room."));
-          return;
-        }
-        getSocket().emit(
+    async (code: string) => {
+      const seat = loadRecentSeat(code);
+      if (!seat) {
+        throw new Error("No saved seat in this room.");
+      }
+      try {
+        await request(
           "room:rejoin",
           { code: seat.code, playerId: seat.playerId },
-          (res: AckResult<{ ok: true }>) => {
-            if (res.ok) {
-              persist({
-                code: seat.code,
-                playerId: seat.playerId,
-                isHost: seat.isHost,
-                name: seat.name,
-              });
-              resolve();
-            } else {
-              // The seat is gone — forget it so we stop offering to rejoin it.
-              clearRecentSeat(code);
-              reject(new Error(res.error));
-            }
-          }
+          "Couldn't rejoin that game.",
+          false
         );
-      }),
-    [persist]
+      } catch (e) {
+        if (!(e instanceof RequestTimeout)) {
+          // The seat is gone — forget it so we stop offering to rejoin it.
+          clearRecentSeat(code);
+        }
+        throw e;
+      }
+      persist({
+        code: seat.code,
+        playerId: seat.playerId,
+        isHost: seat.isHost,
+        name: seat.name,
+      });
+    },
+    [persist, request]
   );
 
   const leave = useCallback(() => {
-    const current = identityRef.current;
-    if (current) {
-      clearRecentSeat(current.code);
-    }
+    // Tell the server, or the seat stays occupied by a ghost: the room keeps
+    // counting them, never sweeps, and stays advertised in the games browser.
+    // Fire-and-forget — we're navigating away regardless, and the seat is
+    // released again by the next create/join on this socket if it misses.
+    getSocket().emit("room:leave");
+    // The recovery record deliberately survives. Leave is one tap next to the
+    // room code, and clearing it here used to make an accidental tap during a
+    // started game unrecoverable — `room:join` is lobby-only, so there was no
+    // way back in.
     setSeatLost(false);
     persist(null);
     setState(null);
   }, [persist]);
 
   const simpleAction = useCallback(
-    (event: NoArgEvent) =>
-      new Promise<void>((resolve, reject) => {
-        // These events carry no payload, only an ack callback. The generated
-        // socket overloads collapse the ack arg to `never`, so emit through a
-        // narrowly-typed view to keep things type-safe without `any`.
-        const sock = getSocket() as unknown as {
-          emit: (
-            event: NoArgEvent,
-            ack: (res: AckResult<{ ok: true }>) => void
-          ) => void;
-        };
-        sock.emit(event, (res: AckResult<{ ok: true }>) => {
-          if (res?.ok) {
-            resolve();
-          } else {
-            reject(new Error(res?.error ?? "Action failed."));
-          }
-        });
-      }),
-    []
+    (event: NoArgEvent) => request<void>(event, undefined, "Action failed."),
+    [request]
   );
 
   const submitPhoto = useCallback(
     (dataUrl: string) =>
-      new Promise<void>((resolve, reject) => {
-        getSocket().emit(
-          "photo:submit",
-          { dataUrl },
-          (res: AckResult<{ ok: true }>) => {
-            if (res?.ok) {
-              resolve();
-            } else {
-              reject(new Error(res?.error ?? "Upload failed."));
-            }
-          }
-        );
-      }),
-    []
+      request<void>("photo:submit", { dataUrl }, "Upload failed."),
+    [request]
   );
 
   const setGameType = useCallback(
     (gameType: GameType) =>
-      new Promise<void>((resolve, reject) => {
-        getSocket().emit(
-          "host:setGameType",
-          { gameType },
-          (res: AckResult<{ ok: true }>) => {
-            if (res?.ok) {
-              resolve();
-            } else {
-              reject(new Error(res?.error ?? "Couldn't switch the game."));
-            }
-          }
-        );
-      }),
-    []
+      request<void>(
+        "host:setGameType",
+        { gameType },
+        "Couldn't switch the game."
+      ),
+    [request]
   );
 
   const submitGuess = useCallback(
     (choiceId: string) =>
-      new Promise<void>((resolve, reject) => {
-        getSocket().emit(
-          "guess:submit",
-          { choiceId },
-          (res: AckResult<{ ok: true }>) => {
-            if (res?.ok) {
-              resolve();
-            } else {
-              reject(new Error(res?.error ?? "Guess failed."));
-            }
-          }
-        );
-      }),
-    []
+      request<void>("guess:submit", { choiceId }, "Guess failed."),
+    [request]
   );
 
   const startGeoGame = useCallback(
     (roundDurationSec: number, hostPlaying: boolean) =>
-      new Promise<void>((resolve, reject) => {
-        getSocket().emit(
-          "host:startGeoGame",
-          { roundDurationSec, hostPlaying },
-          (res: AckResult<{ ok: true }>) => {
-            if (res?.ok) {
-              resolve();
-            } else {
-              reject(new Error(res?.error ?? "Couldn't start the game."));
-            }
-          }
-        );
-      }),
-    []
+      request<void>(
+        "host:startGeoGame",
+        { roundDurationSec, hostPlaying },
+        "Couldn't start the game."
+      ),
+    [request]
   );
 
   const submitGeoGuess = useCallback(
     (lat: number, lng: number) =>
-      new Promise<void>((resolve, reject) => {
-        getSocket().emit(
-          "geo:guess",
-          { lat, lng },
-          (res: AckResult<{ ok: true }>) => {
-            if (res?.ok) {
-              resolve();
-            } else {
-              reject(new Error(res?.error ?? "Guess failed."));
-            }
-          }
-        );
-      }),
-    []
+      request<void>("geo:guess", { lat, lng }, "Guess failed."),
+    [request]
   );
 
   const startWordChain = useCallback(
@@ -580,56 +642,34 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       difficulty: WordChainDifficultyChoice,
       length: number
     ) =>
-      new Promise<void>((resolve, reject) => {
-        getSocket().emit(
-          "host:startWordChain",
-          { durationSec, hostPlaying, difficulty, length },
-          (res: AckResult<{ ok: true }>) => {
-            if (res?.ok) {
-              resolve();
-            } else {
-              reject(new Error(res?.error ?? "Couldn't start the game."));
-            }
-          }
-        );
-      }),
-    []
+      request<void>(
+        "host:startWordChain",
+        { durationSec, hostPlaying, difficulty, length },
+        "Couldn't start the game."
+      ),
+    [request]
   );
 
   // Resolves for both right and wrong answers — "wrong" isn't an error, it's
   // the answer. Only a rejected action (not in the room, round over) throws.
   const submitWordGuess = useCallback(
     (index: number, guess: string) =>
-      new Promise<WordChainGuessResult>((resolve, reject) => {
-        getSocket().emit(
-          "word:guess",
-          { index, guess },
-          (res: AckResult<WordChainGuessResult>) => {
-            if (res?.ok) {
-              resolve(res);
-            } else {
-              reject(new Error(res?.error ?? "Couldn't submit that answer."));
-            }
-          }
-        );
-      }),
-    []
+      request<WordChainGuessResult>(
+        "word:guess",
+        { index, guess },
+        "Couldn't submit that answer."
+      ),
+    [request]
   );
 
   const revealWordHint = useCallback(
     (index: number) =>
-      new Promise<{ index: number; revealed: string; hintsUsed: number }>(
-        (resolve, reject) => {
-          getSocket().emit("word:hint", { index }, (res) => {
-            if (res?.ok) {
-              resolve(res);
-            } else {
-              reject(new Error(res?.error ?? "No hint available."));
-            }
-          });
-        }
+      request<{ index: number; revealed: string; hintsUsed: number }>(
+        "word:hint",
+        { index },
+        "No hint available."
       ),
-    []
+    [request]
   );
 
   const startDrawIt = useCallback(
@@ -638,38 +678,18 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
       hostPlaying: boolean,
       difficulty: DrawDifficultyChoice
     ) =>
-      new Promise<void>((resolve, reject) => {
-        getSocket().emit(
-          "host:startDrawIt",
-          { roundDurationSec, hostPlaying, difficulty },
-          (res: AckResult<{ ok: true }>) => {
-            if (res?.ok) {
-              resolve();
-            } else {
-              reject(new Error(res?.error ?? "Couldn't start the game."));
-            }
-          }
-        );
-      }),
-    []
+      request<void>(
+        "host:startDrawIt",
+        { roundDurationSec, hostPlaying, difficulty },
+        "Couldn't start the game."
+      ),
+    [request]
   );
 
   const pickDrawWord = useCallback(
     (word: string) =>
-      new Promise<void>((resolve, reject) => {
-        getSocket().emit(
-          "draw:pickWord",
-          { word },
-          (res: AckResult<{ ok: true }>) => {
-            if (res?.ok) {
-              resolve();
-            } else {
-              reject(new Error(res?.error ?? "Couldn't pick that word."));
-            }
-          }
-        );
-      }),
-    []
+      request<void>("draw:pickWord", { word }, "Couldn't pick that word."),
+    [request]
   );
 
   /**
@@ -684,47 +704,31 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
    * seen the line, and a dropped one is corrected by the next snapshot.
    */
   const sendDrawStroke = useCallback((stroke: DrawStroke) => {
-    getSocket().emit("draw:ink", { strokes: [stroke] });
+    // Dropped rather than buffered while the seat is down: socket.io would hold
+    // the segment and flush it on reconnect, painting it into whatever round is
+    // running by then. The local copy is still kept so the drawer's own line
+    // doesn't disappear, and the next snapshot settles the difference.
+    if (seatReadyRef.current) {
+      getSocket().emit("draw:ink", { strokes: [stroke] });
+    }
     setState((s) => applyDrawInk(s, [stroke]));
   }, []);
 
   const canvasAction = useCallback(
     (event: "draw:undo" | "draw:clear") =>
-      new Promise<void>((resolve, reject) => {
-        const sock = getSocket() as unknown as {
-          emit: (
-            event: "draw:undo" | "draw:clear",
-            ack: (res: AckResult<{ ok: true }>) => void
-          ) => void;
-        };
-        sock.emit(event, (res) => {
-          if (res?.ok) {
-            resolve();
-          } else {
-            reject(new Error(res?.error ?? "That didn't work."));
-          }
-        });
-      }),
-    []
+      request<void>(event, undefined, "That didn't work."),
+    [request]
   );
 
   // Resolves for right and wrong alike — "wrong" is an answer, not an error.
   const submitDrawGuess = useCallback(
     (text: string) =>
-      new Promise<DrawGuessResult>((resolve, reject) => {
-        getSocket().emit(
-          "draw:guess",
-          { text },
-          (res: AckResult<DrawGuessResult>) => {
-            if (res?.ok) {
-              resolve(res);
-            } else {
-              reject(new Error(res?.error ?? "Couldn't send that guess."));
-            }
-          }
-        );
-      }),
-    []
+      request<DrawGuessResult>(
+        "draw:guess",
+        { text },
+        "Couldn't send that guess."
+      ),
+    [request]
   );
 
   const me = useMemo(() => {
@@ -736,16 +740,23 @@ export function GameProvider({ children }: { children: React.ReactNode }) {
 
   const value: GameContextValue = {
     connected,
+    ready: connected && seatReady,
     state,
     identity,
     me,
-    isHost: Boolean(identity?.isHost),
+    // Read from the room, not from what we were told when we joined. The host
+    // moves now — if the host leaves, someone still in the room takes over —
+    // and an identity captured at create time would leave the new host without
+    // controls and the old one pressing buttons that answer "Only the host can
+    // do that". The stored flag is only a stand-in until the first snapshot.
+    isHost: state ? state.hostId === identity?.playerId : Boolean(identity?.isHost),
     createRoom,
     joinRoom,
     checkName,
     rejoin,
     rejoinRecent,
     seatLost,
+    lostReason,
     leave,
     setGameType,
     startSubmission: () => simpleAction("host:startSubmission"),
