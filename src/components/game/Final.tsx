@@ -14,7 +14,7 @@ export function Final() {
   const ranked = useMemo(
     () =>
       [...(state?.players ?? [])]
-        .filter((p) => !p.spectator)
+        .filter((p) => !p.spectator && (!p.left || p.score > 0))
         .sort((a, b) => b.score - a.score),
     [state]
   );

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useState } from "react";
 import { useGame } from "@/components/GameProvider";
 import { NameClaimFields } from "@/components/NameClaimFields";
+import { ResumeSeats } from "@/components/ResumeSeats";
 import { Button } from "@/components/ui";
 import {
   DEFAULT_GAME_TYPE,
@@ -63,7 +64,11 @@ export default function Home() {
           plays from their phone.
         </p>
 
-        <div className="card mt-10 space-y-4 p-6 text-left">
+        <div className="mt-10">
+          <ResumeSeats />
+        </div>
+
+        <div className="card space-y-4 p-6 text-left">
           <NameClaimFields
             name={name}
             setName={setName}

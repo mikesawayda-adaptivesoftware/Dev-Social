@@ -20,6 +20,7 @@ import {
   type RoomState,
   type PublicPlayer,
   type PublicRoomSummary,
+  type SeatStatus,
   type RoomVisibility,
   type DrawChatLine,
   type DrawDifficultyChoice,
@@ -84,6 +85,18 @@ interface InternalPlayer {
   isHost: boolean;
   connected: boolean;
   socketId?: string;
+  /**
+   * They deliberately left, rather than dropping out.
+   *
+   * A flag rather than deleting the record, because avatar colour is allocated
+   * by join index (see `joinRoom`) and removing an entry would hand the next
+   * arrival a colour someone is already using. It also keeps reveal screens
+   * able to name whoever played an earlier round.
+   *
+   * Cleared by `rejoin`: leaving is recoverable, since it's a single tap next
+   * to the room code on a phone.
+   */
+  left: boolean;
 }
 
 interface InternalPhoto {
@@ -205,6 +218,19 @@ interface Room {
   // Whether the host competes. When false the host is a pure spectator (runs the
   // big screen) and is hidden from scoreboards, rankings, and persistence.
   hostPlaying: boolean;
+  /**
+   * Who is sitting this game out, fixed when it starts.
+   *
+   * Spectator status used to be derived from "is the host, and the host isn't
+   * playing" — which was fine while the host could never change. Now that the
+   * crown moves when a host leaves, deriving it would quietly hand the new host
+   * the old one's spectator status: they'd stop scoring mid-game and the person
+   * who left would appear on the season leaderboard with nothing.
+   *
+   * Recording it once at kick-off decouples the two. Unset in the lobby and for
+   * games where the host plays, where the old derivation still applies.
+   */
+  spectatorId?: string;
   settings: GameSettings;
   players: Map<string, InternalPlayer>;
   photos: InternalPhoto[];
@@ -221,6 +247,17 @@ interface Room {
   // so the remaining players aren't stuck waiting on an absent host. Cancelled
   // if the host reconnects in time.
   autoAdvanceTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * Per-player "they might just be refreshing" timers, keyed by player id.
+   *
+   * A refresh closes the socket cleanly, so `disconnect` fires at once. Acting
+   * on it immediately is what let a drawer's refresh end the round they were
+   * drawing. The consequences wait behind these instead, and a rejoin cancels
+   * them.
+   */
+  graceTimers: Map<string, ReturnType<typeof setTimeout>>;
+  /** Longer grace before the crown moves — see HOST_ABSENT_MIGRATE_MS. */
+  hostGraceTimer?: ReturnType<typeof setTimeout>;
   createdAt: number;
   // Last time anything happened in this room. Drives the sweep, so an idle room
   // is reaped on how long it's been dead rather than how long ago it was made.
@@ -231,6 +268,24 @@ interface Room {
 // How long to hold on a reveal before auto-advancing when the host is gone.
 // Long enough for a brief network blip / page reload to recover control.
 const HOST_ABSENT_REVEAL_MS = 15_000;
+
+/**
+ * How long a dropped player is treated as still here.
+ *
+ * Long enough to cover a phone refresh and a quick tunnel, short enough that a
+ * genuine dropout doesn't hold up an early close for long — everyone else is
+ * sitting there watching the clock.
+ */
+const DISCONNECT_GRACE_MS = 8_000;
+
+/**
+ * How long before an absent host loses the room to someone still in it.
+ *
+ * Much longer than the general grace: taking the crown off a host who is
+ * reloading a page would be its own kind of broken, and nothing is actually
+ * stuck in the meantime — the reveal auto-advance keeps a running game moving.
+ */
+const HOST_ABSENT_MIGRATE_MS = 30_000;
 
 const MAX_GEO_POINTS = 5000;
 // Distance (km) scale for the exponential score decay. Larger = more forgiving.
@@ -346,8 +401,37 @@ export class RoomStore {
   // persist results to Supabase without coupling game logic to the database.
   onGameFinished: (code: string) => void = () => {};
 
+  // A seat was claimed by a newer connection, so an older socket is still
+  // holding it. The store has no `io`, so the socket layer is asked to retire
+  // that socket rather than leaving two of them able to act as one player.
+  onSocketEvicted: (socketId: string, reason: string) => void = () => {};
+
   getRoom(code: string): Room | undefined {
     return this.rooms.get(code.toUpperCase());
+  }
+
+  /**
+   * Is this remembered seat still real, and what is its game doing?
+   *
+   * A seat the player has left still counts: leaving is recoverable, and the
+   * point of this is to offer the way back. Null means the client should forget
+   * it — the room is gone, or that playerId was never in it.
+   */
+  describeSeat(code: string, playerId: string): SeatStatus | null {
+    const room = this.rooms.get(code.toUpperCase());
+    const player = room?.players.get(playerId);
+    if (!room || !player) {
+      return null;
+    }
+    return {
+      code: room.code,
+      name: player.name,
+      hostName: room.players.get(room.hostId)?.name ?? "Host",
+      gameType: room.gameType,
+      phase: room.phase,
+      playerCount: this.activeCount(room),
+      isHost: room.hostId === playerId,
+    };
   }
 
   /**
@@ -366,17 +450,21 @@ export class RoomStore {
       if (room.visibility !== "public" || room.phase !== "lobby") {
         continue;
       }
-      if (room.players.size >= MAX_PLAYERS_PER_ROOM) {
+      // Both numbers are seats that still belong to somebody: a leaver's seat
+      // stays in the map so reveal screens can name them, but showing it here
+      // would advertise a fuller room than the one you'd actually walk into.
+      const active = this.activeCount(room);
+      if (active >= MAX_PLAYERS_PER_ROOM) {
         continue;
       }
-      if (![...room.players.values()].some((p) => p.connected)) {
+      if (![...room.players.values()].some((p) => p.connected && !p.left)) {
         continue;
       }
       summaries.push({
         code: room.code,
         hostName: room.players.get(room.hostId)?.name ?? "Host",
         gameType: room.gameType,
-        playerCount: room.players.size,
+        playerCount: active,
         maxPlayers: MAX_PLAYERS_PER_ROOM,
         createdAt: room.createdAt,
       });
@@ -398,9 +486,119 @@ export class RoomStore {
     }
   }
 
-  /** A player who is in the room but not competing (a non-playing host). */
+  /**
+   * A player who is in the room but not competing (a non-playing host).
+   *
+   * Prefers the id frozen at kick-off, so the crown can move without moving who
+   * scores. Falls back to the old derivation in the lobby, where no game has
+   * started and there is nothing to freeze yet.
+   */
   private isSpectator(room: Room, playerId: string): boolean {
+    if (room.spectatorId !== undefined) {
+      return playerId === room.spectatorId;
+    }
     return playerId === room.hostId && !room.hostPlaying;
+  }
+
+  /** Record who sits out, for the whole of the game about to start. */
+  private setSpectator(room: Room, hostPlaying: boolean) {
+    room.spectatorId = hostPlaying ? undefined : room.hostId;
+  }
+
+  /**
+   * Still in the room: hasn't left, and is either connected or inside the grace
+   * we allow for a refresh.
+   *
+   * This is what makes the grace period mean anything. Early-close checks ask
+   * "has everyone still here answered?", and a player mid-refresh is already
+   * `connected: false` — so without counting them present, somebody else's
+   * answer would close the round out from under them anyway.
+   */
+  private isPresent(room: Room, player: InternalPlayer): boolean {
+    return !player.left && (player.connected || room.graceTimers.has(player.id));
+  }
+
+  /** Everyone still in the room and playing — no leavers, no spectator. */
+  private competitors(room: Room): InternalPlayer[] {
+    return [...room.players.values()].filter(
+      (p) => !p.left && !this.isSpectator(room, p.id)
+    );
+  }
+
+  /** Seats that still belong to somebody. Leavers free theirs up. */
+  private activeCount(room: Room): number {
+    return [...room.players.values()].filter((p) => !p.left).length;
+  }
+
+  /** Every timer a room owns. Anything that deletes a room must call this, or
+   * a stray callback fires against a code that no longer exists. */
+  private clearRoomTimers(room: Room) {
+    if (room.roundTimer) {
+      clearTimeout(room.roundTimer);
+      room.roundTimer = undefined;
+    }
+    if (room.autoAdvanceTimer) {
+      clearTimeout(room.autoAdvanceTimer);
+      room.autoAdvanceTimer = undefined;
+    }
+    if (room.hostGraceTimer) {
+      clearTimeout(room.hostGraceTimer);
+      room.hostGraceTimer = undefined;
+    }
+    for (const timer of room.graceTimers.values()) {
+      clearTimeout(timer);
+    }
+    room.graceTimers.clear();
+  }
+
+  /** Stop waiting on a player — they're back, or they've formally gone. */
+  private cancelGrace(room: Room, playerId: string) {
+    const timer = room.graceTimers.get(playerId);
+    if (timer) {
+      clearTimeout(timer);
+      room.graceTimers.delete(playerId);
+    }
+    if (playerId === room.hostId && room.hostGraceTimer) {
+      clearTimeout(room.hostGraceTimer);
+      room.hostGraceTimer = undefined;
+    }
+  }
+
+  /**
+   * Hand the room to somebody still in it.
+   *
+   * Insertion order on the players Map is join order, so the first eligible
+   * candidate is the longest-standing — no extra bookkeeping needed. Returns
+   * false when there's nobody to promote, which leaves `hostId` pointing at the
+   * departed host; the sweep deals with a room in that state.
+   *
+   * Deliberately does not touch `spectatorId`. Who sits out was fixed at
+   * kick-off precisely so the crown can move without the scoreboard moving
+   * with it.
+   */
+  private migrateHost(room: Room): boolean {
+    const heir = [...room.players.values()].find(
+      (p) => !p.left && p.connected && p.id !== room.hostId
+    );
+    if (!heir) {
+      return false;
+    }
+    const previous = room.players.get(room.hostId);
+    if (previous) {
+      previous.isHost = false;
+    }
+    heir.isHost = true;
+    room.hostId = heir.id;
+    // The new host is present, so nothing needs advancing on their behalf.
+    if (room.autoAdvanceTimer) {
+      clearTimeout(room.autoAdvanceTimer);
+      room.autoAdvanceTimer = undefined;
+    }
+    if (room.hostGraceTimer) {
+      clearTimeout(room.hostGraceTimer);
+      room.hostGraceTimer = undefined;
+    }
+    return true;
   }
 
   /**
@@ -410,7 +608,7 @@ export class RoomStore {
    */
   private competitorNames(room: Room, hostPlaying: boolean): string[] {
     return [...room.players.values()]
-      .filter((p) => hostPlaying || p.id !== room.hostId)
+      .filter((p) => !p.left && (hostPlaying || p.id !== room.hostId))
       .map((p) => p.name);
   }
 
@@ -462,6 +660,7 @@ export class RoomStore {
       wordRounds: [],
       drawRounds: [],
       currentRound: 0,
+      graceTimers: new Map(),
       createdAt: now,
       lastActivityAt: now,
       persisted: false,
@@ -473,6 +672,7 @@ export class RoomStore {
       score: 0,
       isHost: true,
       connected: true,
+      left: false,
     });
     this.rooms.set(code, room);
     return { code, playerId };
@@ -487,7 +687,9 @@ export class RoomStore {
     if (room.phase !== "lobby") {
       throw new RoomError("This game has already started.");
     }
-    if (room.players.size >= MAX_PLAYERS_PER_ROOM) {
+    // Capacity counts seats still taken — a leaver frees theirs. The colour
+    // index below deliberately does not, see the comment there.
+    if (this.activeCount(room) >= MAX_PLAYERS_PER_ROOM) {
       throw new RoomError("This room is full.");
     }
     validatePin(pin);
@@ -496,8 +698,10 @@ export class RoomStore {
       throw new RoomError(claim.reason);
     }
     const playerId = nanoid(10);
-    // Join order indexes the color. Safe because players are never removed from
-    // a room — if a leave/kick is ever added, this needs a real allocator.
+    // Join order indexes the colour, and it must stay a monotonic count of
+    // everyone who has *ever* joined — including leavers, whose records are
+    // kept precisely so this stays true. Using the live seat count instead
+    // would re-issue a colour someone in the room is still wearing.
     const color = playerColor(room.players.size);
     room.players.set(playerId, {
       id: playerId,
@@ -506,6 +710,7 @@ export class RoomStore {
       score: 0,
       isHost: false,
       connected: true,
+      left: false,
     });
     this.touch(room);
     return { code: room.code, playerId };
@@ -517,16 +722,68 @@ export class RoomStore {
     if (!player) {
       throw new RoomError("You are no longer part of this room.");
     }
+    const previousSocketId = player.socketId;
     player.connected = true;
     player.socketId = socketId;
+    // Coming back un-leaves you. This is what makes Leave recoverable.
+    player.left = false;
+    // They're back inside the grace, so none of the "they've gone" consequences
+    // should fire.
+    this.cancelGrace(room, playerId);
     // If the host is coming back, cancel any pending host-absent auto-advance so
     // they resume control of the reveal.
     if (player.id === room.hostId && room.autoAdvanceTimer) {
       clearTimeout(room.autoAdvanceTimer);
       room.autoAdvanceTimer = undefined;
     }
+    // Two live sockets driving one seat is worse than none — the older one can
+    // still act, because its `socket.data` was never invalidated. Tell the
+    // socket layer to retire it.
+    if (previousSocketId && previousSocketId !== socketId) {
+      this.onSocketEvicted(
+        previousSocketId,
+        "This game was opened somewhere else."
+      );
+    }
     this.touch(room);
     return room;
+  }
+
+  /**
+   * Give up a seat deliberately.
+   *
+   * Unlike a disconnect this gets no grace — the intent is explicit, so the
+   * room should stop counting them at once. Returns what the socket layer needs
+   * to know: whether the room is now gone, and whether the crown moved.
+   */
+  leaveRoom(
+    code: string,
+    playerId: string
+  ): { roomClosed: boolean; hostChanged: boolean } {
+    const room = this.getRoom(code);
+    const player = room?.players.get(playerId);
+    if (!room || !player || player.left) {
+      return { roomClosed: false, hostChanged: false };
+    }
+    player.left = true;
+    player.connected = false;
+    player.socketId = undefined;
+    this.cancelGrace(room, playerId);
+
+    // Nobody left to play for. Drop the room now rather than leaving an empty
+    // lobby advertised in the games browser for another ten minutes.
+    if (this.activeCount(room) === 0) {
+      this.clearRoomTimers(room);
+      this.rooms.delete(code);
+      return { roomClosed: true, hostChanged: false };
+    }
+
+    const hostChanged =
+      playerId === room.hostId ? this.migrateHost(room) : false;
+    // The consequences a disconnect would defer, applied immediately.
+    this.applyAbsence(room);
+    this.touch(room);
+    return { roomClosed: false, hostChanged };
   }
 
   attachSocket(code: string, playerId: string, socketId: string) {
@@ -642,7 +899,14 @@ export class RoomStore {
       );
     }
 
-    const allPlayerIds = [...room.players.keys()];
+    // Photo Guessr has no host-playing toggle of its own, so this freezes
+    // whatever the room already had — same result as the old derivation, but
+    // now immune to the host changing mid-game.
+    this.setSpectator(room, room.hostPlaying);
+
+    const allPlayerIds = [...room.players.keys()].filter(
+      (id) => !room.players.get(id)?.left
+    );
     room.rounds = shuffle(room.photos).map((photo) => {
       const decoyPool = shuffle(
         allPlayerIds.filter((id) => id !== photo.ownerId)
@@ -732,6 +996,7 @@ export class RoomStore {
 
     room.gameType = "geo_guessr";
     room.hostPlaying = hostPlaying;
+    this.setSpectator(room, hostPlaying);
     room.settings.roundDurationSec = duration;
     room.geoRounds = rounds;
     room.rounds = [];
@@ -853,6 +1118,7 @@ export class RoomStore {
 
     room.gameType = "word_chain";
     room.hostPlaying = hostPlaying;
+    this.setSpectator(room, hostPlaying);
     room.settings.roundDurationSec = duration;
     room.wordRounds = [
       {
@@ -1090,8 +1356,8 @@ export class RoomStore {
    * separate because "done" here is finishing, not having an entry.
    */
   private allConnectedFinished(room: Room, round: WordChainRound): boolean {
-    const connected = [...room.players.values()].filter(
-      (p) => p.connected && !this.isSpectator(room, p.id)
+    const connected = this.competitors(room).filter((p) =>
+      this.isPresent(room, p)
     );
     return (
       connected.length > 0 &&
@@ -1177,6 +1443,7 @@ export class RoomStore {
 
     room.gameType = "draw_it";
     room.hostPlaying = hostPlaying;
+    this.setSpectator(room, hostPlaying);
     room.settings.roundDurationSec = duration;
     room.drawRounds = rounds;
     room.geoRounds = [];
@@ -1420,11 +1687,8 @@ export class RoomStore {
 
   /** Everyone who could guess, has. */
   private allConnectedSolved(room: Room, round: DrawRound): boolean {
-    const guessers = [...room.players.values()].filter(
-      (p) =>
-        p.connected &&
-        p.id !== round.drawerId &&
-        !this.isSpectator(room, p.id)
+    const guessers = this.competitors(room).filter(
+      (p) => p.id !== round.drawerId && this.isPresent(room, p)
     );
     return (
       guessers.length > 0 &&
@@ -1432,11 +1696,17 @@ export class RoomStore {
     );
   }
 
-  /** Everyone in the room who is guessing this round. */
+  /**
+   * Everyone in the room who is guessing this round.
+   *
+   * Leavers are excluded, which matters more here than elsewhere: this is the
+   * denominator of the drawer's score, so counting someone who walked out would
+   * quietly mark the drawing down for failing to reach them.
+   */
   private drawGuesserIds(room: Room, round: DrawRound): string[] {
-    return [...room.players.keys()].filter(
-      (id) => id !== round.drawerId && !this.isSpectator(room, id)
-    );
+    return this.competitors(room)
+      .filter((p) => p.id !== round.drawerId)
+      .map((p) => p.id);
   }
 
   /** What the drawer earned: the ceiling, scaled by the share who solved it. */
@@ -1484,28 +1754,83 @@ export class RoomStore {
     room: Room,
     round: { guesses: Map<string, unknown> }
   ): boolean {
-    const connected = [...room.players.values()].filter(
-      (p) => p.connected && !this.isSpectator(room, p.id)
+    const connected = this.competitors(room).filter((p) =>
+      this.isPresent(room, p)
     );
     return connected.length > 0 && connected.every((p) => round.guesses.has(p.id));
   }
 
   /**
-   * Called after a player disconnects. If that leaves the current round in a
-   * state where all remaining connected players have already guessed, close it
-   * early; if the host dropped during a reveal, schedule an auto-advance so the
-   * game doesn't stall.
+   * A player dropped. Wait a moment before acting on it.
+   *
+   * A refresh closes the socket cleanly, so `disconnect` fires instantly and
+   * looks exactly like someone walking out — which is how a drawer refreshing
+   * their phone used to end the round they were drawing. Everything
+   * destructive now waits behind a short grace, and coming back cancels it.
+   *
+   * The host gets a longer one before the crown moves, since re-electing a host
+   * over a two-second refresh would be its own kind of wonky.
    */
-  handleDisconnect(code: string) {
+  handleDisconnect(code: string, playerId: string) {
     const room = this.getRoom(code);
-    if (!room) {
+    if (!room || room.graceTimers.has(playerId)) {
       return;
     }
+    room.graceTimers.set(
+      playerId,
+      setTimeout(() => {
+        room.graceTimers.delete(playerId);
+        // They may have come back and gone again, or left properly, or the room
+        // may be gone entirely — re-check rather than trusting the schedule.
+        if (this.rooms.get(room.code) !== room) {
+          return;
+        }
+        if (room.players.get(playerId)?.connected) {
+          return;
+        }
+        this.applyAbsence(room);
+        this.onRoomChanged(room.code);
+      }, DISCONNECT_GRACE_MS)
+    );
+
+    if (playerId === room.hostId && !room.hostGraceTimer) {
+      room.hostGraceTimer = setTimeout(() => {
+        room.hostGraceTimer = undefined;
+        if (this.rooms.get(room.code) !== room) {
+          return;
+        }
+        if (room.players.get(room.hostId)?.connected) {
+          return;
+        }
+        // Gone for good as far as anyone can tell. Someone else takes over, so
+        // the lobby can be started and the scoreboard can be moved on — neither
+        // of which any timer covers.
+        if (this.migrateHost(room)) {
+          this.onRoomChanged(room.code);
+        }
+      }, HOST_ABSENT_MIGRATE_MS);
+    }
+  }
+
+  /**
+   * Apply the consequences of somebody no longer being here: close a round that
+   * everyone remaining has finished, or unstick one whose drawer has gone.
+   *
+   * Split out of `handleDisconnect` so a deliberate leave can run it at once
+   * while a drop runs it only after the grace.
+   */
+  /** Whether the drawer is still around — mid-refresh counts as around. */
+  private isDrawerPresent(room: Room, round: DrawRound): boolean {
+    const drawer = room.players.get(round.drawerId);
+    return Boolean(drawer && this.isPresent(room, drawer));
+  }
+
+  private applyAbsence(room: Room) {
     if (room.gameType === "draw_it" && room.phase === "picking") {
       // Nobody to choose. Take the first word so the room isn't stuck behind
       // someone who has gone.
       const round = room.drawRounds[room.currentRound];
-      if (round && !round.word && !room.players.get(round.drawerId)?.connected) {
+      if (round && !round.word && !this.isDrawerPresent(room, round)) {
         this.commitWord(room, round, round.choices[0]);
       }
     } else if (room.gameType === "draw_it" && room.phase === "playing") {
@@ -1513,7 +1838,7 @@ export class RoomStore {
       if (round && !round.closed) {
         // The drawer leaving ends the round — there is nothing left to guess
         // from. Whoever already solved it keeps what they earned.
-        if (!room.players.get(round.drawerId)?.connected) {
+        if (!this.isDrawerPresent(room, round)) {
           this.closeRound(room);
         } else if (this.allConnectedSolved(room, round)) {
           this.closeRound(room);
@@ -1649,11 +1974,11 @@ export class RoomStore {
       points,
     });
 
-    // Auto-close once every connected eligible player has answered.
-    // Disconnected players aren't waited on, so one dropout can't force the
-    // round to run out its full timer.
+    // Auto-close once every eligible player still here has answered. Someone
+    // who has genuinely gone isn't waited on, so one dropout can't force the
+    // round to run out its full timer — but someone mid-refresh still is.
     const eligible = [...room.players.values()].filter(
-      (p) => p.connected && p.id !== round.ownerId
+      (p) => this.isPresent(room, p) && p.id !== round.ownerId
     );
     if (eligible.length > 0 && eligible.every((p) => round.guesses.has(p.id))) {
       this.closeRound(room);
@@ -1786,14 +2111,7 @@ export class RoomStore {
   playAgain(code: string, playerId: string) {
     const room = this.requireRoom(code);
     this.requireHost(room, playerId);
-    if (room.roundTimer) {
-      clearTimeout(room.roundTimer);
-      room.roundTimer = undefined;
-    }
-    if (room.autoAdvanceTimer) {
-      clearTimeout(room.autoAdvanceTimer);
-      room.autoAdvanceTimer = undefined;
-    }
+    this.clearRoomTimers(room);
     room.phase = "lobby";
     room.photos = [];
     room.rounds = [];
@@ -1803,6 +2121,9 @@ export class RoomStore {
     room.currentRound = 0;
     room.persisted = false;
     room.hostPlaying = false;
+    // Back to being decided at the next kick-off, so a room that changed hands
+    // doesn't carry the old host's sitting-out status into the next game.
+    room.spectatorId = undefined;
     // Back to the default the lobby picker opens on. Leaving the finished game's
     // type here would desync the room from a host who then picks the other game.
     room.gameType = DEFAULT_GAME_TYPE;
@@ -1824,8 +2145,11 @@ export class RoomStore {
     }
     room.persisted = true;
     const host = room.players.get(room.hostId);
+    // Someone who walked out mid-game still played the rounds they played, so
+    // they keep their placement if they scored. A lobby ghost who left before
+    // anything happened doesn't belong on the season leaderboard.
     const ranked = [...room.players.values()]
-      .filter((p) => !this.isSpectator(room, p.id))
+      .filter((p) => !this.isSpectator(room, p.id) && (!p.left || p.score > 0))
       .sort((a, b) => b.score - a.score);
     return {
       code: room.code,
@@ -1901,6 +2225,7 @@ export class RoomStore {
       score: player.score,
       isHost: player.isHost,
       connected: player.connected,
+      left: player.left,
       photoCount: room.photos.filter((p) => p.ownerId === player.id).length,
       spectator: this.isSpectator(room, player.id),
     };
@@ -1959,6 +2284,7 @@ export class RoomStore {
       score: p.score,
       isHost: p.isHost,
       connected: p.connected,
+      left: p.left,
       photoCount: photoCounts.get(p.id) ?? 0,
       spectator: this.isSpectator(room, p.id),
     }));
@@ -2039,9 +2365,7 @@ export class RoomStore {
     }
 
     if (room.gameType === "word_chain") {
-      const competitorIds = [...room.players.keys()].filter(
-        (id) => !this.isSpectator(room, id)
-      );
+      const competitorIds = this.competitors(room).map((p) => p.id);
 
       if (room.phase === "playing" || room.phase === "reveal") {
         const round = room.wordRounds[room.currentRound];
@@ -2113,9 +2437,7 @@ export class RoomStore {
     }
 
     if (room.gameType === "geo_guessr") {
-      const competitorCount = [...room.players.keys()].filter(
-        (id) => !this.isSpectator(room, id)
-      ).length;
+      const competitorCount = this.competitors(room).length;
 
       if (room.phase === "playing") {
         const round = room.geoRounds[room.currentRound];
@@ -2136,8 +2458,7 @@ export class RoomStore {
 
       if (room.phase === "reveal") {
         const round = room.geoRounds[room.currentRound];
-        const results = [...room.players.values()]
-          .filter((p) => !this.isSpectator(room, p.id))
+        const results = this.competitors(room)
           .map((p) => {
             const g = round.guesses.get(p.id);
             return {
@@ -2212,10 +2533,13 @@ export class RoomStore {
     return state;
   }
 
-  /** Competitors, best score first. Spectators never appear. */
+  /**
+   * Competitors, best score first. Spectators never appear, and nor do people
+   * who left without scoring — but a leaver who played rounds keeps their place.
+   */
   private finalRanking(room: Room): { playerId: string; score: number }[] {
     return [...room.players.values()]
-      .filter((p) => !this.isSpectator(room, p.id))
+      .filter((p) => !this.isSpectator(room, p.id) && (!p.left || p.score > 0))
       .sort((a, b) => b.score - a.score)
       .map((p) => ({ playerId: p.id, score: p.score }));
   }
@@ -2236,15 +2560,12 @@ export class RoomStore {
   sweep(ttlMs = 1000 * 60 * 60 * 6, emptyLobbyTtlMs = 1000 * 60 * 10) {
     const now = Date.now();
     for (const [code, room] of this.rooms) {
-      const anyConnected = [...room.players.values()].some((p) => p.connected);
+      const anyConnected = [...room.players.values()].some(
+        (p) => p.connected && !p.left
+      );
       const ttl = room.phase === "lobby" ? emptyLobbyTtlMs : ttlMs;
       if (!anyConnected && now - room.lastActivityAt > ttl) {
-        if (room.roundTimer) {
-          clearTimeout(room.roundTimer);
-        }
-        if (room.autoAdvanceTimer) {
-          clearTimeout(room.autoAdvanceTimer);
-        }
+        this.clearRoomTimers(room);
         this.rooms.delete(code);
       }
     }

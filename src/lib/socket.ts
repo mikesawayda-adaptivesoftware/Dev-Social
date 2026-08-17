@@ -146,6 +146,16 @@ export function loadRecentSeat(code: string): RecentSeat | null {
   return readRecentSeats()[code.toUpperCase()] ?? null;
 }
 
+/**
+ * Every seat this browser remembers, most recent first.
+ *
+ * Only a hint — these are the seats we *wrote down*, not the ones that still
+ * exist. Ask the server (`seats:check`) before showing any of them to someone.
+ */
+export function listRecentSeats(): RecentSeat[] {
+  return Object.values(readRecentSeats()).sort((a, b) => b.savedAt - a.savedAt);
+}
+
 export function clearRecentSeat(code: string) {
   try {
     const seats = readRecentSeats();

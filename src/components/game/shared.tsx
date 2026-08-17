@@ -18,6 +18,9 @@ export function PlayerList({
   highlightId?: string;
   maxVisible?: number;
 }) {
+  // People who left keep their roster entry so reveal screens can still name
+  // them for rounds they played, but they aren't in the room any more.
+  players = players.filter((p) => !p.left);
   const overflow = Math.max(0, players.length - maxVisible);
   let visible = players;
   if (overflow > 0) {
@@ -102,8 +105,10 @@ export function Leaderboard({
   compact?: boolean;
   maxRows?: number;
 }) {
+  // A leaver who actually played keeps their place; one who never scored is
+  // just noise on the board.
   const ranked = [...players]
-    .filter((p) => !p.spectator)
+    .filter((p) => !p.spectator && (!p.left || p.score > 0))
     .sort((a, b) => b.score - a.score);
 
   const top = ranked.slice(0, maxRows);

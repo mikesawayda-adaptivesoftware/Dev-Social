@@ -277,10 +277,16 @@ server/
   wordChains.ts           # Seeded Word Chain puzzle bank (generated) + normalizing
   drawWords.ts            # Draw It word bank (3 tiers) + guess normalizing
 scripts/
-  smoke.mjs, smoke2.mjs   # End-to-end socket tests (node scripts/smoke.mjs)
+  harness.mjs             # emit/connect/assert/watchState shared by the session tests
+  smoke.mjs, smoke2.mjs   # Photo Guessr flow tests (that game is out of rotation)
   smokeGeo.mjs            # GeoGuessr socket flow test
   smokeWordChain.mjs      # Word Chain socket flow test
   smokeDrawIt.mjs         # Draw It socket flow test (asserts the word can't leak)
+  smokeLeave.mjs          # Leaving, and the duplicate-room bug it was hiding
+  smokeReconnect.mjs      # A refresh mid-round must not destroy the round
+  smokeHostMigration.mjs  # The crown moves when the host goes, and only then
+  smokeStaleSocket.mjs    # One seat, one socket
+  smokeSeats.mjs          # seats:check — which remembered seats are still alive
   generateWordChains.mjs  # Walk the vetted link graph to grow the puzzle bank
   resolvePanos.ts         # Bake Street View panorama ids into the pool
 ```
@@ -291,8 +297,24 @@ pushes a *personalized, role-aware* view to each player on every change
 emit intent events (`guess:submit`, `host:nextRound`, …). Answers and other
 players' choices are hidden from the view until the reveal phase.
 
-**Reconnects.** Each player's `{ code, playerId }` is stored in `localStorage`,
-so a refresh or dropped connection automatically rejoins their seat.
+**Reconnects.** The active `{ code, playerId }` lives in **sessionStorage**, so a
+refresh rejoins the seat automatically — and two people playing from one browser
+keep separate seats, which a shared localStorage identity would not allow.
+localStorage holds only a *recovery hint* per room code, used for the explicit
+"jump back in" prompts. Nothing ever auto-rejoins from it.
+
+Around that, four rules keep a game intact when phones misbehave:
+
+- **A dropped player gets a grace period** (`DISCONNECT_GRACE_MS`) before any
+  consequence lands, and counts as present until it expires. Refreshing your
+  phone mid-round no longer closes the round you were drawing.
+- **A seat can only be held by one socket.** Re-claiming it retires the old one
+  with `room:closed`, which is how a sleeping phone stops shadow-holding a seat.
+- **The crown moves** if the host leaves — to the longest-standing player — but
+  not if they merely drop, and never changes who is playing: who sits out is
+  tracked separately from who hosts.
+- **Leaving is undoable.** `room:leave` frees the seat and the room, but keeps
+  the record, so a mis-tap during a started game is one tap to recover.
 
 ## Adding a new game next month
 
@@ -689,11 +711,16 @@ server {
 | `npm run dev`      | Next app + realtime server (hot reload)        |
 | `npm run build`    | Production build + type check                  |
 | `npm start`        | Run the production app + realtime server       |
-| `node scripts/smoke.mjs`  | End-to-end flow test against `:3001`    |
-| `node scripts/smoke2.mjs` | Deterministic scoring test              |
+| `node scripts/smoke.mjs`  | End-to-end flow test against `:3001` — Photo Guessr, so it fails while that game is out of `ENABLED_GAME_TYPES` |
+| `node scripts/smoke2.mjs` | Deterministic scoring test (Photo Guessr, same caveat) |
 | `node scripts/smokeGeo.mjs` | Real GeoGuessr socket flow test (skips without a Maps key) |
 | `node scripts/smokeWordChain.mjs` | Word Chain socket flow test (no keys needed) |
 | `node scripts/smokeDrawIt.mjs` | Draw It socket flow test — plays 3 rounds and asserts the word never reaches a guesser |
+| `node scripts/smokeLeave.mjs` | Leaving frees the seat and the room, and one socket can't hold two |
+| `node scripts/smokeReconnect.mjs` | A drop mid-round is deferred, not acted on — and still lands if they don't come back (~20s) |
+| `node scripts/smokeHostMigration.mjs` | The crown moves on leave, stays on a refresh, and never changes who's playing |
+| `node scripts/smokeStaleSocket.mjs` | Re-claiming a seat retires the socket that held it |
+| `node scripts/smokeSeats.mjs` | `seats:check` reports live seats and omits dead ones |
 | `node scripts/generateWordChains.mjs [n]` | Grow the Word Chain bank to n puzzles **per length** (default 400) |
 | `npx tsx scripts/resolvePanos.ts` | Bake Street View panorama ids into the pool |
 | `npm run lint`     | ESLint (also the first CI gate)                |

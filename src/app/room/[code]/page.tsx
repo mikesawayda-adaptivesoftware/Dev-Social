@@ -24,8 +24,11 @@ export default function RoomPage() {
     state,
     identity,
     connected,
+    ready,
     isHost,
     seatLost,
+    lostReason,
+    rejoin,
     rejoinRecent,
     leave,
   } = useGame();
@@ -50,8 +53,8 @@ export default function RoomPage() {
           This game is no longer available
         </p>
         <p className="max-w-xs text-sm text-white/60">
-          It may have ended, or the game server restarted. You&rsquo;ll need to
-          start or join a new one.
+          {lostReason ??
+            "It may have ended, or the game server restarted. You'll need to start or join a new one."}
         </p>
         <button
           onClick={goHome}
@@ -71,18 +74,21 @@ export default function RoomPage() {
   // --- We have a seat but no state snapshot yet. --------------------------
   if (!state || state.code.toUpperCase() !== code) {
     return (
-      <CenteredCard>
-        <div className="h-10 w-10 animate-spin rounded-full border-2 border-white/20 border-t-fuchsia-400" />
-        <p className="text-white/60">
-          {connected ? "Joining room…" : "Connecting…"}
-        </p>
-      </CenteredCard>
+      <AwaitingState
+        code={code}
+        connected={connected}
+        rejoin={rejoin}
+        rejoinRecent={rejoinRecent}
+      />
     );
   }
 
   return (
     <main className="flex flex-1 flex-col">
-      {!connected && (
+      {/* `ready`, not `connected`: the socket comes back a moment before the
+          server has put us back in the room, and anything tapped in that window
+          is refused. The banner covers the whole gap. */}
+      {!ready && (
         <div className="flex items-center justify-center gap-2 bg-amber-500/15 px-4 py-1.5 text-xs font-medium text-amber-200">
           <span className="h-2 w-2 animate-pulse rounded-full bg-amber-400" />
           Reconnecting… your spot is held.
@@ -151,6 +157,56 @@ function CenteredCard({ children }: { children: React.ReactNode }) {
     <main className="flex flex-1 flex-col items-center justify-center gap-3 px-5 text-center">
       {children}
     </main>
+  );
+}
+
+/**
+ * We hold a seat and we're waiting for its first snapshot.
+ *
+ * Normally that's a few hundred milliseconds — the provider re-claims the seat
+ * on connect and the snapshot follows. But nothing re-drives that if the claim
+ * never went out or its ack was lost, and this screen used to spin forever
+ * waiting for a snapshot that wasn't coming. So after a beat we claim the seat
+ * once from here, and if that doesn't land either we fall through to the
+ * ordinary rejoin prompt rather than spinning.
+ */
+function AwaitingState({
+  code,
+  connected,
+  rejoin,
+  rejoinRecent,
+}: {
+  code: string;
+  connected: boolean;
+  rejoin: (code: string) => Promise<void>;
+  rejoinRecent: (code: string) => Promise<void>;
+}) {
+  const [gaveUp, setGaveUp] = useState(false);
+
+  useEffect(() => {
+    if (!connected) {
+      return;
+    }
+    const t = setTimeout(() => {
+      // If this succeeds a snapshot follows and this component unmounts; if it
+      // doesn't, the prompt below is the honest thing to show.
+      rejoin(code).catch(() => {});
+      setGaveUp(true);
+    }, 3000);
+    return () => clearTimeout(t);
+  }, [code, connected, rejoin]);
+
+  if (gaveUp) {
+    return <RejoinGate code={code} rejoinRecent={rejoinRecent} />;
+  }
+
+  return (
+    <CenteredCard>
+      <div className="h-10 w-10 animate-spin rounded-full border-2 border-white/20 border-t-fuchsia-400" />
+      <p className="text-white/60">
+        {connected ? "Joining room…" : "Connecting…"}
+      </p>
+    </CenteredCard>
   );
 }
 
