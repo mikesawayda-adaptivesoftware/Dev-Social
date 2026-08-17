@@ -16,11 +16,14 @@ import { DrawCanvas } from "@/components/game/draw/DrawCanvas";
 
 type Tab = "overall" | GameType;
 
+// Derived, not listed: a hand-written list silently omitted Draw It when it
+// shipped, and its whole season was unreachable. Every *known* type gets a tab,
+// including ones out of rotation — their finished games are still history.
 const TABS: { id: Tab; label: string }[] = [
   { id: "overall", label: "Overall" },
-  { id: "photo_guessr", label: GAME_TYPE_LABELS.photo_guessr },
-  { id: "geo_guessr", label: GAME_TYPE_LABELS.geo_guessr },
-  { id: "word_chain", label: GAME_TYPE_LABELS.word_chain },
+  ...(Object.entries(GAME_TYPE_LABELS) as [GameType, string][]).map(
+    ([id, label]) => ({ id, label })
+  ),
 ];
 
 function gameTypeLabel(type: string): string {
@@ -109,6 +112,16 @@ export default function LeaderboardPage() {
       .sort((a, b) => b.total_score - a.total_score);
   }, [tab, season, byType]);
 
+  // Recent games follow the tab too. A Draw It game listed under Word Chain's
+  // standings is the same category of confusion as the gallery was.
+  const recentForTab = useMemo(
+    () =>
+      tab === "overall"
+        ? (recent ?? [])
+        : (recent ?? []).filter((g) => g.game_type === tab),
+    [tab, recent]
+  );
+
   function toggle(id: string) {
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -159,13 +172,14 @@ export default function LeaderboardPage() {
 
       {!loading && supabaseConfigured && (
         <>
-          {/* Tabs */}
-          <div className="mt-8 flex gap-2 rounded-xl bg-white/5 p-1">
+          {/* Tabs. Scrolls rather than squeezes: on a phone, five equal columns
+              wrap every label onto two lines and it only gets worse per game. */}
+          <div className="mt-8 flex gap-2 overflow-x-auto rounded-xl bg-white/5 p-1">
             {TABS.map((t) => (
               <button
                 key={t.id}
                 onClick={() => setTab(t.id)}
-                className={`flex-1 rounded-lg px-3 py-2 text-sm font-semibold transition-all ${
+                className={`shrink-0 whitespace-nowrap rounded-lg px-3 py-2 text-sm font-semibold transition-all ${
                   tab === t.id
                     ? "bg-gradient-to-r from-violet-500 to-fuchsia-500 text-white shadow"
                     : "text-white/60 hover:text-white"
@@ -236,7 +250,12 @@ export default function LeaderboardPage() {
         </>
       )}
 
-      {drawings && drawings.length > 0 && (
+      {/* The gallery is Draw It's own thing, so it belongs on Draw It's tab and
+          on Overall — not underneath Word Chain's standings, where it read as
+          Word Chain content. */}
+      {(tab === "overall" || tab === "draw_it") &&
+        drawings &&
+        drawings.length > 0 && (
         <section className="mt-12">
           <h2 className="mb-1 text-sm font-bold uppercase tracking-wide text-white/60">
             Gallery
@@ -271,13 +290,13 @@ export default function LeaderboardPage() {
         </section>
       )}
 
-      {recent && recent.length > 0 && (
+      {recentForTab.length > 0 && (
         <section className="mt-12">
           <h2 className="mb-3 text-sm font-bold uppercase tracking-wide text-white/60">
             Recent games
           </h2>
           <ul className="space-y-2">
-            {recent.map((g) => {
+            {recentForTab.map((g) => {
               const isOpen = expanded.has(g.id);
               const standings = [...g.game_players].sort(
                 (a, b) => (a.placement ?? 99) - (b.placement ?? 99)
